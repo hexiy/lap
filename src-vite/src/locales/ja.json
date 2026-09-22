@@ -452,7 +452,8 @@
       "back": "戻る",
       "scanning": "スキャン中…",
       "scan_paused": "スキャン一時停止",
-      "scan_queued": "スキャン待機中"
+      "scan_queued": "スキャン待機中",
+      "show_hidden": "非表示の写真を表示"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "設定",
       "set_desktop_wallpaper": "デスクトップの壁紙に設定",
       "show_info": "情報を表示",
-      "remove_from_collection": "コレクションから削除"
+      "remove_from_collection": "コレクションから削除",
+      "hide": "非表示にする",
+      "unhide": "表示する"
     },
     "calendar": {
       "monthly": "月別",
@@ -1609,5 +1612,16 @@
         "failed_install": "更新のインストールに失敗しました"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "非表示の写真をロック解除",
+    "enter_pin": "PINを入力して非表示の写真を表示します。",
+    "create_pin": "非表示の写真を保護するPINを作成します。",
+    "pin": "PIN",
+    "pin_confirm": "PIN（確認）",
+    "unlock": "ロック解除",
+    "create": "作成",
+    "wrong_pin": "PINが正しくありません。",
+    "pin_mismatch": "PINが一致しません。"
   }
 }

@@ -145,6 +145,15 @@
             @click="toggleMapView"
           />
 
+          <!-- hidden-photos view (albums & library only, requires unlock) -->
+          <TButton
+            :icon="hiddenOnlyMode ? IconUnhide : IconHide"
+            :tooltip="$t('toolbar.tooltip.show_hidden')"
+            :selected="hiddenOnlyMode"
+            :disabled="!hiddenToggleAvailable"
+            @click="toggleHiddenReveal"
+          />
+
           <IconSeparator class="t-icon-size text-base-content/15" />
           <!-- toggle select mode -->
           <TButton
@@ -666,6 +675,12 @@
     @cancel="cancelIndexRecovery"
   />
 
+  <UnlockHiddenDialog
+    v-if="showHiddenUnlockDialog"
+    @unlock="onHiddenUnlocked"
+    @cancel="showHiddenUnlockDialog = false"
+  />
+
   <!-- Drag-drop warning -->
   <MessageBox
     v-if="showDropWarning"
@@ -727,7 +742,8 @@ import { getAlbum, getAllAlbums, recountAlbum, getQueryCountAndSum, getQueryTime
          updateFileInfo, importFile, importUrl, importFileBytes, getDragPayload, importClipboard, addFileToDb, checkFileExists, cancelIndexing as cancelIndexingApi, selectFolder, getFacesForFile, listenFaceIndexProgress,
          openFilesWithApp, getAppConfig, getIndexRecoveryInfo, clearIndexRecoveryInfo, setLastSelectedItemIndex,
          dedupDelete, getQueryFilePosition, getFolderSearchExcluded,
-         listCollections, createCollection, addFilesToCollection, removeFilesFromCollection, getFileCollections, getCollectionCountAndSum, getCollectionFiles, getCollectionGroupedQueryRows, getCollectionGroupFileIds, getCollectionQueryFileIds, fetchFolder, isDirectoryAccessible, checkAlbumAccessibility, addTagToFile } from '@/common/api';
+         listCollections, createCollection, addFilesToCollection, removeFilesFromCollection, getFileCollections, getCollectionCountAndSum, getCollectionFiles, getCollectionGroupedQueryRows, getCollectionGroupFileIds, getCollectionQueryFileIds, fetchFolder, isDirectoryAccessible, checkAlbumAccessibility, addTagToFile,
+         setFilesHidden, unlockHiddenPhotos } from '@/common/api';
 import { config, libConfig } from '@/common/config';
 import {
   gridSizeFromPosition,
@@ -771,6 +787,7 @@ import FileConflictDialog from '@/components/FileConflictDialog.vue';
 import ScrollBar from '@/components/ScrollBar.vue';
 import SliderInput from '@/components/SliderInput.vue';
 import StatusBar from '@/components/StatusBar.vue';
+import UnlockHiddenDialog from '@/components/UnlockHiddenDialog.vue';
 
 import {
   IconFolders,
@@ -820,6 +837,8 @@ import {
   IconSortingDesc,
   IconSortingShuffle,
   IconFilter,
+  IconHide,
+  IconUnhide,
 } from '@/common/icons';
 
 const thumbnailPlaceholder = new URL('@/assets/images/image-file.png', import.meta.url).href;
@@ -1082,6 +1101,11 @@ function removeDeletedFilesFromImageViewerSession(fileIds: number[]) {
   return files.length;
 }
 
+const selectionAllHidden = computed(() => {
+  const items = selectedFiles.value;
+  return items.length > 0 && items.every(file => Number(file?.is_hidden) === 1 || file?.is_hidden === true);
+});
+
 const selectionMenuRef = ref<InstanceType<typeof ContextMenu> | null>(null);
 const selectionMenuIndex = ref(-1);
 const selectionMenuItems = useFileMenuItems(
@@ -1094,6 +1118,7 @@ const selectionMenuItems = useFileMenuItems(
     selectMode: ref(true),
     selectionMediaKind,
     selectionCount: selectedCount,
+    selectionAllHidden,
   },
 );
 
@@ -3071,6 +3096,90 @@ watch(isMapView, (active) => {
   if (active) mapViewMounted.value = true;
 });
 
+// ---- hidden photos (hidden-only mode) ----
+// `hiddenOnlyRevealedFor` records which view context the user unlocked the
+// hidden-photos listing in. When the view changes the key no longer matches
+// and the listing returns to normal files; `getFileList` also clears the
+// stale key so navigating back does not silently re-enter the hidden view.
+const hiddenOnlyRevealedFor = ref<string | null>(null);
+const showHiddenUnlockDialog = ref(false);
+
+// Built from the sidebar/library selection state (including the
+// `activateTick`s, so re-clicking the same sidebar item also re-locks).
+const hiddenContextKey = computed(() =>
+  [config.main.sidebarIndex,
+   libConfig.activePane,
+   libConfig.library.item,
+   libConfig.library.smartId,
+   libConfig.album.id,
+   libConfig.album.folderId,
+   libConfig.album.selected,
+   libConfig.album.activateTick,
+   libConfig.smartAlbum.type,
+   libConfig.smartAlbum.id,
+   libConfig.collection.selectedId,
+   libConfig.collection.activateTick,
+   libConfig.tag.id,
+   libConfig.tag.groupId,
+   libConfig.tag.activateTick,
+   libConfig.calendar.year,
+   libConfig.calendar.month,
+   libConfig.calendar.date,
+   libConfig.camera.make,
+   libConfig.camera.model,
+   libConfig.camera.lensMake,
+   libConfig.camera.lensModel,
+   libConfig.location.cc,
+   libConfig.location.admin1,
+   libConfig.location.name,
+   libConfig.person.id,
+   libConfig.rating.item,
+   libConfig.culling.item,
+   libConfig.search.searchText].join('|'));
+
+const hiddenOnlyMode = computed(() =>
+  hiddenOnlyRevealedFor.value !== null && hiddenOnlyRevealedFor.value === hiddenContextKey.value);
+
+// Hidden files are excluded from every listing surface in the backend. The
+// only place they can be browsed is this hidden-only view, and only from the
+// Album and Library panes — never from tag/calendar/camera/location/person,
+// collection, smart, search, map, temp or scan-streaming views.
+const hiddenToggleAvailable = computed(() =>
+  currentQuerySource.value === 'query' &&
+  libConfig.activePane === 'main' &&
+  (config.main.sidebarIndex === SIDEBAR.LIBRARY || config.main.sidebarIndex === SIDEBAR.ALBUM) &&
+  !(config.main.sidebarIndex === SIDEBAR.LIBRARY && libConfig.library.item === LIB_ITEM.SUBJECTS) &&
+  !isMapView.value &&
+  !isDedupPanelOpen.value &&
+  tempViewMode.value === 'none' &&
+  !isScanStreamingMode.value &&
+  Number(currentQueryParams.value.personId) === 0);
+
+function enterHiddenOnlyMode() {
+  hiddenOnlyRevealedFor.value = hiddenContextKey.value;
+  void updateContent();
+}
+
+async function toggleHiddenReveal() {
+  if (hiddenOnlyMode.value) {
+    hiddenOnlyRevealedFor.value = null;
+    void updateContent();
+    return;
+  }
+  if (!hiddenToggleAvailable.value) return;
+  const outcome = await unlockHiddenPhotos();
+  if (outcome?.status === 'unlocked') {
+    enterHiddenOnlyMode();
+  } else if (outcome?.status === 'pin_required') {
+    showHiddenUnlockDialog.value = true;
+  }
+}
+
+function onHiddenUnlocked() {
+  showHiddenUnlockDialog.value = false;
+  enterHiddenOnlyMode();
+}
+
 function passesSmallFileFilter(file: any) {
   const threshold = Number(config.settings.smallFileFilter || 0);
   if (![160, 320, 640].includes(threshold)) return true;
@@ -3960,6 +4069,8 @@ function handleItemAction(payload: { action: string, index: number }) {
         forceSplitCount: files.length === 2 ? 2 : 4,
       });
     },
+    'hide': () => void applyHiddenToTargets(true),
+    'unhide': () => void applyHiddenToTargets(false),
     'copy': () => void clickCopyImages(fileList.value[selectedItemIndex.value]),
     'rename': clickRename,
     'move-within-library': () => showMoveTo.value = true,
@@ -6628,6 +6739,13 @@ async function getFileList(
   currentCollectionId.value = sourceContext?.source === 'collection' ? sourceContext.collectionId || null : null;
   currentSearchFileIds.value = [];
 
+  // Drop a stale reveal key before the params object is replaced so a later
+  // navigation back to this context does not silently re-enter hidden-only mode.
+  if (hiddenOnlyRevealedFor.value !== null && hiddenOnlyRevealedFor.value !== hiddenContextKey.value) {
+    hiddenOnlyRevealedFor.value = null;
+  }
+  const hiddenOnly = hiddenOnlyMode.value;
+
   // Update current query params with all fields
   currentQueryParams.value = {
     searchFileType,
@@ -6659,6 +6777,7 @@ async function getFileList(
     gpsMaxLat,
     gpsMinLon,
     gpsMaxLon,
+    hiddenOnly,
   };
 
   if (sourceContext?.source === 'smart') {
@@ -7773,7 +7892,9 @@ function exitTempViewMode() {
   selectedItemIndex.value = state.selectedItemIndex;
   scrollPosition.value = state.scrollPosition;
   timelineData.value = state.timelineData;
-  currentQueryParams.value = state.currentQueryParams;
+  // The backed-up params may carry hiddenOnly from a revealed session;
+  // re-derive it from the current reveal state instead of trusting it.
+  currentQueryParams.value = { ...state.currentQueryParams, hiddenOnly: hiddenOnlyMode.value };
   currentQuerySource.value = state.currentQuerySource || 'query';
   currentSmartQueryParams.value = state.currentSmartQueryParams || null;
   currentCollectionId.value = state.currentCollectionId || null;
@@ -9046,6 +9167,63 @@ const selectModeSetCullingFlags = async (cullingFlag: number) => {
     syncFileMetaToImageViewer(activeItem.id, { culling_flag: normalized });
   }
   void tauriEmit('culling-status-updated', { fileIds: items.map(item => item.id), cullingFlag: normalized });
+};
+
+// Hide/unhide the focused file or the current selection. When the file's new
+// state takes it out of the current listing (hide in a normal view, unhide in
+// the hidden-only view) it is spliced out like a delete; otherwise the flag is
+// updated in place so the badge and menu state reflect it.
+const applyHiddenToTargets = async (hidden: boolean) => {
+  const items = selectMode.value && selectedCount.value > 0
+    ? await getActionableSelectedItemsForAction()
+    : [fileList.value[selectedItemIndex.value]];
+  if (!items || items.length === 0) return;
+  const targets = items.filter(
+    item => item && !item.isPlaceholder && Boolean(item.is_hidden) !== hidden,
+  );
+  const ids = targets.map(item => Number(item.id)).filter(id => id > 0);
+  if (ids.length === 0) return;
+  if (!await confirmLargeBatch(ids.length)) return;
+  const changed = await setFilesHidden(ids, hidden);
+  if (changed === null || Number(changed) === 0) return;
+
+  const idSet = new Set(ids);
+  ids.forEach(id => selectedFileIds.delete(id));
+  if (hidden !== hiddenOnlyMode.value) {
+    for (let i = fileList.value.length - 1; i >= 0; i--) {
+      if (idSet.has(Number(fileList.value[i]?.id))) {
+        fileList.value.splice(i, 1);
+      }
+    }
+    totalFileCount.value = fileList.value.length;
+    totalFileSize.value = fileList.value.reduce((total, file) => total + (file?.size || 0), 0);
+    if (fileList.value.length === 0) {
+      selectedItemIndex.value = -1;
+    } else {
+      selectedItemIndex.value = Math.min(selectedItemIndex.value, fileList.value.length - 1);
+      if (selectedItemIndex.value < 0) selectedItemIndex.value = 0;
+    }
+    const compareFileCount = removeDeletedFilesFromImageViewerSession(ids);
+    void tauriEmit('files-deleted', {
+      source: 'content',
+      fileIds: ids,
+      fileCount: fileList.value.length,
+      compareFileCount,
+      selectedIndex: selectedItemIndex.value,
+    });
+    // Folder/album counts are computed excluding hidden files; drop the
+    // cached values so the next refresh shows the reduced totals.
+    clearFolderFileCounts();
+  } else {
+    for (const item of fileList.value) {
+      if (idSet.has(Number(item?.id))) item.is_hidden = hidden;
+    }
+    for (const item of targets) {
+      item.is_hidden = hidden;
+    }
+    ids.forEach(id => syncFileMetaToImageViewer(id, { is_hidden: hidden }));
+  }
+  await updateSelectedImage(selectedItemIndex.value);
 };
 
 // slide show

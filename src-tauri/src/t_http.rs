@@ -221,6 +221,16 @@ async fn handle_video_http_connection(mut stream: tokio::net::TcpStream) -> std:
         .await;
     };
 
+    // Hidden files are not served while the session is locked.
+    if crate::t_sqlite::AFile::is_path_hidden(&file_path) && !crate::t_auth::is_unlocked() {
+        return write_http_headers(
+            &mut stream,
+            "404 Not Found",
+            &[("Content-Length", "0".to_string())],
+        )
+        .await;
+    }
+
     let Ok(metadata) = tokio::fs::metadata(&file_path).await else {
         return write_http_headers(
             &mut stream,

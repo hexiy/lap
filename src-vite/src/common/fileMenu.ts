@@ -27,6 +27,8 @@ import {
   IconBookmark,
   IconSplitOn,
   IconSplitOn4,
+  IconHide,
+  IconUnhide,
 } from '@/common/icons';
 
 const OPEN_IN_APP_LABELS = {
@@ -45,6 +47,7 @@ export const useFileMenuItems = (
     selectMode?: Ref<boolean>;
     selectionMediaKind?: Ref<'image' | 'video' | 'mixed' | 'empty'>;
     selectionCount?: Ref<number>;
+    selectionAllHidden?: Ref<boolean>;
   }
 ) => {
   const createAction = (actionName: string) => () => onAction(actionName);
@@ -80,6 +83,9 @@ export const useFileMenuItems = (
     const kind = options?.selectionMediaKind?.value ?? 'empty';
     const externalAppKind = kind === 'image' || kind === 'video' ? kind : undefined;
     const selectionCount = options?.selectionCount?.value ?? 0;
+    // Hide is offered when any selected file is visible; Unhide only when
+    // every selected file is hidden.
+    const allHidden = options?.selectionAllHidden?.value ?? false;
     return [
       {
         label: String(localeMsg.value.menu.file.compare_selected_images || 'Compare selected images'),
@@ -88,6 +94,12 @@ export const useFileMenuItems = (
         action: createAction('compare-selected-images'),
       },
       externalAppMenu(externalAppKind),
+      { label: '-', action: null },
+      {
+        label: String(localeMsg.value.menu.file[allHidden ? 'unhide' : 'hide'] || (allHidden ? 'Unhide' : 'Hide')),
+        icon: markRaw(allHidden ? IconUnhide : IconHide),
+        action: createAction(allHidden ? 'unhide' : 'hide'),
+      },
     ];
   };
 
@@ -306,6 +318,11 @@ export const useFileMenuItems = (
             action: createAction('set-desktop-wallpaper'),
           },
         ],
+      },
+      {
+        label: f.is_hidden ? localeMsg.value.menu.file.unhide : localeMsg.value.menu.file.hide,
+        icon: markRaw(f.is_hidden ? IconUnhide : IconHide),
+        action: createAction(f.is_hidden ? 'unhide' : 'hide')
       },
       { label: "-", action: null },
       {

@@ -473,8 +473,9 @@ impl Album {
                      WHERE a.id = ?1
                        AND b.album_id = ?2
                        AND (a.file_type = 1 OR a.file_type = 2)
-                       AND {}",
+                       AND {} AND {}",
                 AFile::live_photo_companion_exclusion_condition(),
+                AFile::hidden_exclusion_condition("a"),
             );
             let cover_is_available: Option<i64> = conn
                 .query_row(&cover_query, params![cover_file_id, id], |row| row.get(0))
@@ -494,10 +495,11 @@ impl Album {
                 JOIN athumbs c ON a.id = c.file_id
                 WHERE b.album_id = ?1
                   AND (a.file_type = 1 OR a.file_type = 2)
-                  AND {}
+                  AND {} AND {}
                 ORDER BY a.taken_date ASC
                 LIMIT 1",
             AFile::live_photo_companion_exclusion_condition(),
+            AFile::hidden_exclusion_condition("a"),
         );
         let file_id: Option<i64> = conn
             .query_row(&fallback_query, params![id], |row| row.get(0))
@@ -561,12 +563,13 @@ impl Album {
             "SELECT b.album_id, COUNT(DISTINCT a.id)
              FROM afiles a
              JOIN afolders b ON b.id = a.folder_id
-             WHERE {} AND {}{}{}
+             WHERE {} AND {}{}{} AND {}
              GROUP BY b.album_id",
             AFile::search_exclusion_condition("b"),
             AFile::live_photo_companion_exclusion_condition(),
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
+            AFile::hidden_exclusion_condition("a"),
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
@@ -1309,7 +1312,7 @@ impl AFolder {
                     )
                 ),
                 (SELECT COUNT(*) FROM afiles f
-                 WHERE f.folder_id = a.id AND f.id NOT IN (
+                 WHERE f.folder_id = a.id AND COALESCE(f.is_hidden, 0) = 0 AND f.id NOT IN (
                     SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
                  ))
             FROM afolders a
@@ -1448,6 +1451,7 @@ pub struct AFile {
 
     // extra info
     pub is_favorite: Option<bool>, // is favorite
+    pub is_hidden: Option<bool>,   // hidden behind the reveal toggle (fork flag)
     pub rating: Option<i32>,       // 0-5 stars
     pub culling_flag: Option<i32>, // 0: unreviewed, 1: pick, 2: reject
     pub rotate: Option<i32>,       // rotate angle (0, 90, 180, 270)
@@ -1610,12 +1614,13 @@ impl ACollection {
              FROM acollections_files cf
              JOIN afiles a ON a.id = cf.file_id
              JOIN afolders b ON b.id = a.folder_id
-             WHERE {}{}{} AND {}
+             WHERE {}{}{} AND {} AND {}
              GROUP BY cf.collection_id",
             AFile::live_photo_companion_exclusion_condition(),
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
+            AFile::hidden_exclusion_condition("a"),
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
@@ -1656,6 +1661,7 @@ impl ACollection {
             FROM acollections c
             LEFT JOIN acollections_files cf ON cf.collection_id = c.id
             LEFT JOIN afiles a ON a.id = cf.file_id
+                AND COALESCE(a.is_hidden, 0) = 0
                 AND a.id NOT IN (
                     SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
                 )
@@ -1973,6 +1979,8 @@ pub struct QueryParams {
     pub location_name: String,
     pub is_favorite: bool,
     pub rating: i64,
+    #[serde(default)]
+    pub hidden_only: bool,
     #[serde(default = "default_culling_flag")]
     pub culling_flag: i64,
     pub tag_id: i64,
@@ -2036,6 +2044,8 @@ pub struct SmartQueryParams {
     pub gps_min_lon: Option<f64>,
     #[serde(default)]
     pub gps_max_lon: Option<f64>,
+    #[serde(default)]
+    pub hidden_only: bool,
 }
 
 fn default_smart_query_version() -> i32 {
@@ -2128,7 +2138,7 @@ impl AFile {
     pub fn get_library_visible_counts(small_file_filter: i64) -> Result<LibraryVisibleCounts, String> {
         let conn = open_conn()?;
         let today = chrono::Local::now().format("%m-%d").to_string();
-        let query = format!("SELECT COUNT(*), COALESCE(SUM(a.is_favorite=1),0), COALESCE(SUM(strftime('%m-%d',a.taken_date,'unixepoch','localtime')=?1),0), COALESCE(SUM(a.rating>0),0), COALESCE(SUM(a.rating=0),0), COALESCE(SUM(a.rating=1),0), COALESCE(SUM(a.rating=2),0), COALESCE(SUM(a.rating=3),0), COALESCE(SUM(a.rating=4),0), COALESCE(SUM(a.rating=5),0), COALESCE(SUM(a.culling_flag=1),0), COALESCE(SUM(a.culling_flag=2),0), COALESCE(SUM(a.culling_flag=0),0) FROM afiles a JOIN afolders b ON b.id=a.folder_id WHERE {} AND {}{}{}", Self::search_exclusion_condition("b"), Self::live_photo_companion_exclusion_condition(), Self::small_file_filter_sql(small_file_filter, "a"), Self::inaccessible_album_filter("b"));
+        let query = format!("SELECT COUNT(*), COALESCE(SUM(a.is_favorite=1),0), COALESCE(SUM(strftime('%m-%d',a.taken_date,'unixepoch','localtime')=?1),0), COALESCE(SUM(a.rating>0),0), COALESCE(SUM(a.rating=0),0), COALESCE(SUM(a.rating=1),0), COALESCE(SUM(a.rating=2),0), COALESCE(SUM(a.rating=3),0), COALESCE(SUM(a.rating=4),0), COALESCE(SUM(a.rating=5),0), COALESCE(SUM(a.culling_flag=1),0), COALESCE(SUM(a.culling_flag=2),0), COALESCE(SUM(a.culling_flag=0),0) FROM afiles a JOIN afolders b ON b.id=a.folder_id WHERE {} AND {}{}{} AND {}", Self::search_exclusion_condition("b"), Self::live_photo_companion_exclusion_condition(), Self::small_file_filter_sql(small_file_filter, "a"), Self::inaccessible_album_filter("b"), Self::hidden_exclusion_condition("a"));
         conn.query_row(&query, params![today], |r| Ok(LibraryVisibleCounts { all:r.get(0)?, favorite:r.get(1)?, today:r.get(2)?, rated:r.get(3)?, unrated:r.get(4)?, rating_1:r.get(5)?, rating_2:r.get(6)?, rating_3:r.get(7)?, rating_4:r.get(8)?, rating_5:r.get(9)?, pick:r.get(10)?, reject:r.get(11)?, unreviewed:r.get(12)? })).map_err(|e| e.to_string())
     }
     fn inaccessible_album_filter(folder_alias: &str) -> String {
@@ -2563,6 +2573,7 @@ impl AFile {
             duration: Some(duration as i64),
 
             is_favorite: None,
+            is_hidden: None,
             rating: Some(0),
             culling_flag: Some(0),
             rotate: None,
@@ -3119,6 +3130,19 @@ impl AFile {
         "a.id NOT IN (SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL)"
     }
 
+    /// Hidden files are excluded from every listing surface; only the main grid
+    /// query may reveal them (via QueryParams.hidden_only while unlocked).
+    /// `COALESCE` keeps this correct on databases where the column pre-dates use.
+    pub(crate) fn hidden_exclusion_condition(alias: &str) -> String {
+        format!("COALESCE({alias}.is_hidden, 0) = 0")
+    }
+
+    /// Inverse of `hidden_exclusion_condition`: lists only hidden files. Used
+    /// by the main grid's reveal mode (hidden_only).
+    pub(crate) fn hidden_only_condition(alias: &str) -> String {
+        format!("COALESCE({alias}.is_hidden, 0) = 1")
+    }
+
     // build the base SQL query
     fn build_base_query() -> String {
         String::from(
@@ -3144,7 +3168,8 @@ impl AFile {
                     THEN lpf.path || '/' || lpv.name
                     ELSE NULL
                 END AS live_photo_video_path,
-                a.motion_photo_offset
+                a.motion_photo_offset,
+                a.is_hidden
             FROM afiles a
             LEFT JOIN afolders b ON a.folder_id = b.id
             LEFT JOIN albums c ON b.album_id = c.id
@@ -3222,6 +3247,7 @@ impl AFile {
             live_photo_video_id: row.get(53)?,
             live_photo_video_path: row.get(54)?,
             motion_photo_offset: row.get(55)?,
+            is_hidden: row.get::<_, Option<i64>>(56)?.map(|v| v != 0),
         })
     }
 
@@ -3288,7 +3314,7 @@ impl AFile {
         collection_id: i64,
         params: &QueryParams,
     ) -> Result<(i64, i64), String> {
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
         let collection_join = " INNER JOIN acollections_files cf ON a.id = cf.file_id";
 
@@ -3321,7 +3347,7 @@ impl AFile {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Self>, String> {
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
 
         let mut query = Self::build_base_query();
@@ -3352,7 +3378,7 @@ impl AFile {
         else {
             return Ok(Vec::new());
         };
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
         let sql = format!(
             "SELECT group_id, group_id AS label, COUNT(*), COALESCE(SUM(size), 0)
@@ -3405,7 +3431,7 @@ impl AFile {
         else {
             return Ok(Vec::new());
         };
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
 
         let mut query = Self::build_base_query();
@@ -3459,7 +3485,7 @@ impl AFile {
         else {
             return Ok(Vec::new());
         };
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
         let query = format!(
             "SELECT a.id
@@ -3483,7 +3509,7 @@ impl AFile {
         collection_id: i64,
         params: &QueryParams,
     ) -> Result<Vec<i64>, String> {
-        let (joins, where_clause, sql_params) = Self::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = Self::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let where_clause = Self::append_condition(where_clause, "cf.collection_id = ?");
         let query = format!(
             "SELECT a.id
@@ -3848,6 +3874,73 @@ impl AFile {
         let query = format!("UPDATE afiles SET {} = ?1 WHERE id = ?2", column);
         conn.execute(&query, params![value, file_id])
             .map_err(|e| e.to_string())
+    }
+
+    /// Set or clear the hidden flag on files. This is the ONLY write path for
+    /// `is_hidden` — refresh/rescan/move code must not touch it so the flag
+    /// survives when the official app or the fork rewrites file rows.
+    /// Idempotent: repeated calls with the same value are no-ops.
+    pub fn set_hidden_on(conn: &Connection, file_ids: &[i64], hidden: bool) -> Result<usize, String> {
+        if file_ids.is_empty() {
+            return Ok(0);
+        }
+        let value: i64 = if hidden { 1 } else { 0 };
+        let mut stmt = conn
+            .prepare_cached("UPDATE afiles SET is_hidden = ?1 WHERE id = ?2 AND COALESCE(is_hidden, 0) != ?1")
+            .map_err(|e| e.to_string())?;
+        let mut changed = 0usize;
+        for file_id in file_ids {
+            changed += stmt
+                .execute(params![value, file_id])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(changed)
+    }
+
+    pub fn set_hidden(file_ids: &[i64], hidden: bool) -> Result<usize, String> {
+        let conn = open_conn()?;
+        Self::set_hidden_on(&conn, file_ids, hidden)
+    }
+
+    /// Hidden-state lookup for the media-serving gates. Missing rows and DB
+    /// errors resolve to `false` — those paths 404 on their own later anyway.
+    pub fn is_hidden(file_id: i64) -> bool {
+        open_conn()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(is_hidden, 0) FROM afiles WHERE id = ?1",
+                    params![file_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            != 0
+    }
+
+    /// Same lookup by absolute path for the Linux video HTTP server, which
+    /// resolves requests as `folder_path + '/' + file_name`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn is_path_hidden(file_path: &str) -> bool {
+        open_conn()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT COALESCE(a.is_hidden, 0)
+                     FROM afiles a JOIN afolders b ON b.id = a.folder_id
+                     WHERE (b.path || '/' || a.name) = ?1",
+                    params![file_path],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+            != 0
     }
 
     pub fn batch_update_names(updates: &[(i64, String, Option<String>)]) -> Result<usize, String> {
@@ -4462,7 +4555,7 @@ impl AFile {
             "SELECT {} AS group_date, COUNT(1)
             FROM afiles a
             JOIN afolders b ON a.folder_id = b.id
-            WHERE {} IS NOT NULL AND {} >= 86400 AND {}{}{} AND {}
+            WHERE {} IS NOT NULL AND {} >= 86400 AND {}{}{} AND {} AND {}
             GROUP BY {}
             ORDER BY group_date {}",
             date_expr,
@@ -4472,6 +4565,7 @@ impl AFile {
             Self::inaccessible_album_filter("b"),
             Self::small_file_filter_sql(small_file_filter, "a"),
             Self::search_exclusion_condition("b"),
+            Self::hidden_exclusion_condition("a"),
             date_expr,
             order_clause
         );
@@ -4605,6 +4699,14 @@ impl AFile {
 
         if params.is_favorite {
             conditions.push("a.is_favorite = 1".to_string());
+        }
+
+        // Hidden files stay out of People views even while the grid reveal is
+        // on; hidden_only lists only hidden files elsewhere in the grid.
+        if params.hidden_only && params.person_id == 0 {
+            conditions.push(Self::hidden_only_condition("a"));
+        } else {
+            conditions.push(Self::hidden_exclusion_condition("a"));
         }
 
         if params.rating == -2 {
@@ -5722,6 +5824,11 @@ impl AFile {
 
         conditions.push(Self::search_exclusion_condition("b"));
         conditions.push(Self::live_photo_companion_exclusion_condition().to_string());
+        if params.hidden_only {
+            conditions.push(Self::hidden_only_condition("a"));
+        } else {
+            conditions.push(Self::hidden_exclusion_condition("a"));
+        }
 
         if let (Some(min_lat), Some(max_lat), Some(min_lon), Some(max_lon)) = (
             params.gps_min_lat,
@@ -6410,6 +6517,8 @@ impl AFile {
 
         query.push_str(" AND ");
         query.push_str(&Self::search_exclusion_condition("b"));
+        query.push_str(" AND ");
+        query.push_str(&Self::hidden_exclusion_condition("a"));
 
         let inaccessible_album_ids = t_utils::inaccessible_album_ids();
         if !inaccessible_album_ids.is_empty() {
@@ -7715,6 +7824,7 @@ impl AThumb {
 
         conditions.push("a.folder_id = ?".to_string());
         params.push(&folder_id);
+        conditions.push(AFile::hidden_exclusion_condition("a"));
 
         if let Some(condition) = AFile::build_file_type_condition(file_type) {
             conditions.push(condition);
@@ -7799,11 +7909,12 @@ impl ATag {
             "(SELECT COUNT(*) FROM afile_tags ft
               JOIN afiles a ON a.id = ft.file_id
               JOIN afolders b ON b.id = a.folder_id
-              WHERE ft.tag_id = atags.id AND {}{}{} AND {})",
+              WHERE ft.tag_id = atags.id AND {}{}{} AND {} AND {})",
             AFile::live_photo_companion_exclusion_condition(),
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
+            AFile::hidden_exclusion_condition("a"),
         );
         let order_clause = match sort {
             1 => "atags.name DESC".to_string(),
@@ -7835,12 +7946,13 @@ impl ATag {
              FROM afile_tags ft
              JOIN afiles a ON a.id = ft.file_id
              JOIN afolders b ON b.id = a.folder_id
-             WHERE {}{}{} AND {}
+             WHERE {}{}{} AND {} AND {}
              GROUP BY ft.tag_id",
             AFile::live_photo_companion_exclusion_condition(),
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
+            AFile::hidden_exclusion_condition("a"),
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
@@ -7860,12 +7972,13 @@ impl ATag {
              JOIN atags t ON t.id = ft.tag_id
              JOIN afiles a ON a.id = ft.file_id
              JOIN afolders b ON b.id = a.folder_id
-             WHERE {}{}{} AND {}
+             WHERE {}{}{} AND {} AND {}
              GROUP BY t.group_id",
             AFile::live_photo_companion_exclusion_condition(),
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
+            AFile::hidden_exclusion_condition("a"),
         );
         let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
@@ -8267,11 +8380,12 @@ impl Person {
                 .replace('_', "\\_")
         );
         let visible_file_conditions = format!(
-            "{}{} AND {} AND {}",
+            "{}{} AND {} AND {} AND {}",
             AFile::small_file_filter_sql(request.small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
             AFile::live_photo_companion_exclusion_condition(),
+            AFile::hidden_exclusion_condition("a"),
         );
         let visible_person_condition = format!(
             "EXISTS (SELECT 1 FROM faces f JOIN afiles a ON a.id = f.file_id JOIN afolders b ON b.id = a.folder_id WHERE f.person_id = p.id{})",
@@ -8907,11 +9021,12 @@ impl Face {
     pub fn get_stats_full(small_file_filter: i64) -> Result<(usize, usize, usize, usize), String> {
         let conn = open_conn()?;
         let visible_file_conditions = format!(
-            "{}{} AND {} AND {}",
+            "{}{} AND {} AND {} AND {}",
             AFile::small_file_filter_sql(small_file_filter, "a"),
             AFile::inaccessible_album_filter("b"),
             AFile::search_exclusion_condition("b"),
             AFile::live_photo_companion_exclusion_condition(),
+            AFile::hidden_exclusion_condition("a"),
         );
 
         let total: i64 = conn
@@ -8982,9 +9097,9 @@ impl ACamera {
             WHERE a.e_make IS NOT NULL AND a.e_model IS NOT NULL
                 AND a.id NOT IN (
                     SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
-                ){}{} AND {}
+                ){}{} AND {} AND {}
             GROUP BY UPPER(a.e_make), a.e_model
-            ORDER BY UPPER(a.e_make), a.e_model", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"));
+            ORDER BY UPPER(a.e_make), a.e_model", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"), AFile::hidden_exclusion_condition("a"));
 
         let mut stmt = conn.prepare(query.as_str()).map_err(|e| e.to_string())?;
 
@@ -9060,9 +9175,9 @@ impl ALens {
             WHERE a.e_lens_make IS NOT NULL AND a.e_lens_model IS NOT NULL
                 AND a.id NOT IN (
                     SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
-                ){}{} AND {}
+                ){}{} AND {} AND {}
             GROUP BY UPPER(a.e_lens_make), a.e_lens_model
-            ORDER BY UPPER(a.e_lens_make), a.e_lens_model", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"));
+            ORDER BY UPPER(a.e_lens_make), a.e_lens_model", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"), AFile::hidden_exclusion_condition("a"));
 
         let mut stmt = conn.prepare(query.as_str()).map_err(|e| e.to_string())?;
 
@@ -9140,9 +9255,9 @@ impl ALocation {
             WHERE COALESCE(a.geo_admin1, '') <> '' AND COALESCE(a.geo_name, '') <> ''
                 AND a.id NOT IN (
                     SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
-                ){}{} AND {}
+                ){}{} AND {} AND {}
             GROUP BY a.geo_cc, a.geo_admin1, a.geo_name
-            ORDER BY a.geo_cc, a.geo_admin1, a.geo_name", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"));
+            ORDER BY a.geo_cc, a.geo_admin1, a.geo_name", AFile::inaccessible_album_filter("b"), AFile::small_file_filter_sql(small_file_filter, "a"), AFile::search_exclusion_condition("b"), AFile::hidden_exclusion_condition("a"));
 
         let mut stmt = conn.prepare(query.as_str()).map_err(|e| e.to_string())?;
 
@@ -9217,7 +9332,7 @@ pub struct AGpsMapPoint {
 impl AGpsMapPoint {
     pub fn get_map_points_from_db(params: &QueryParams) -> Result<Vec<Self>, String> {
         let conn = open_conn()?;
-        let (joins, where_clause, sql_params) = AFile::build_search_query_parts(params);
+        let (joins, where_clause, sql_params) = AFile::build_search_query_parts(&QueryParams { hidden_only: false, ..params.clone() });
         let query = format!(
             "SELECT AVG(gps_latitude) AS lat, AVG(gps_longitude) AS lon, COUNT(*) AS cnt, MIN(id) AS file_id
              FROM (
@@ -9558,6 +9673,7 @@ fn create_db_internal() -> Result<(), String> {
             media_subtype TEXT,
             live_photo_video_id INTEGER,
             motion_photo_offset INTEGER,
+            is_hidden INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (folder_id) REFERENCES afolders(id) ON DELETE CASCADE
         )",
         [],
@@ -9624,6 +9740,13 @@ fn create_db_internal() -> Result<(), String> {
         "ALTER TABLE afiles ADD COLUMN culling_flag INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Fork-only flag, intentionally NOT a numbered migration: user_version stays
+    // on upstream numbering so official-build migrations always apply. The ALTER
+    // is idempotent (error ignored when the column exists).
+    let _ = conn.execute(
+        "ALTER TABLE afiles ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_afiles_rating ON afiles(rating)",
@@ -9632,6 +9755,11 @@ fn create_db_internal() -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_afiles_culling_flag ON afiles(culling_flag)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_afiles_is_hidden ON afiles(is_hidden)",
         [],
     )
     .map_err(|e| e.to_string())?;
@@ -9927,12 +10055,12 @@ mod tag_group_query_tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE afolders(id INTEGER PRIMARY KEY, album_id INTEGER, path TEXT, is_excluded_from_search INTEGER);
             INSERT INTO afolders VALUES(1, 1, '/visible', 0), (2, 1, '/excluded', 1);
-            CREATE TABLE afiles(id INTEGER PRIMARY KEY, folder_id INTEGER, live_photo_video_id INTEGER, width INTEGER, height INTEGER);
-            INSERT INTO afiles VALUES(1,1,NULL,1000,1000), (2,1,NULL,100,100), (3,1,NULL,1000,1000), (4,2,NULL,1000,1000), (5,1,3,1000,1000), (6,1,NULL,1000,1000);
+            CREATE TABLE afiles(id INTEGER PRIMARY KEY, folder_id INTEGER, live_photo_video_id INTEGER, width INTEGER, height INTEGER, is_hidden INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO afiles VALUES(1,1,NULL,1000,1000,0), (2,1,NULL,100,100,0), (3,1,NULL,1000,1000,0), (4,2,NULL,1000,1000,0), (5,1,3,1000,1000,0), (6,1,NULL,1000,1000,0), (7,1,NULL,1000,1000,1);
             CREATE TABLE atags(id INTEGER PRIMARY KEY, group_id INTEGER);
             INSERT INTO atags VALUES(10,1), (11,1), (12,2);
             CREATE TABLE afile_tags(file_id INTEGER, tag_id INTEGER, PRIMARY KEY(file_id,tag_id));
-            INSERT INTO afile_tags VALUES(1,10), (1,11), (2,10), (3,10), (4,10), (5,10), (6,12);").unwrap();
+            INSERT INTO afile_tags VALUES(1,10), (1,11), (2,10), (3,10), (4,10), (5,10), (6,12), (7,10);").unwrap();
         let mut params: QueryParams = serde_json::from_value(serde_json::json!({
             "searchFileName":"", "searchFileType":0, "sortType":0, "sortOrder":0,
             "searchAllSubfolders":"", "searchFolder":"", "startDate":0, "endDate":0,
@@ -9950,5 +10078,44 @@ mod tag_group_query_tests {
             assert_eq!(counts[&1], expected.len() as i64);
             assert_eq!(counts[&2], 1);
         }
+
+        // hidden_only reveals only hidden file 7 (tag group 1), default keeps it out
+        params.small_file_filter = 160;
+        params.hidden_only = true;
+        let (joins, conditions, values) = AFile::build_search_query_parts(&params);
+        let mut stmt = conn.prepare(&format!("SELECT a.id FROM afiles a JOIN afolders b ON b.id = a.folder_id {joins} {conditions} ORDER BY a.id")).unwrap();
+        let ids: Vec<i64> = stmt.query_map(rusqlite::params_from_iter(values.iter()), |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(ids, vec![7_i64]);
+    }
+
+    #[test]
+    fn set_hidden_is_idempotent_and_scoped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE afiles(id INTEGER PRIMARY KEY, is_hidden INTEGER NOT NULL DEFAULT 0);
+            INSERT INTO afiles(id) VALUES(1), (2), (3), (4);").unwrap();
+
+        assert_eq!(AFile::set_hidden_on(&conn, &[1, 2], true).unwrap(), 2);
+        assert_eq!(AFile::set_hidden_on(&conn, &[1, 2], true).unwrap(), 0);
+        assert_eq!(AFile::set_hidden_on(&conn, &[], true).unwrap(), 0);
+
+        let flags: Vec<i64> = conn
+            .prepare("SELECT is_hidden FROM afiles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(flags, vec![1, 1, 0, 0]);
+
+        assert_eq!(AFile::set_hidden_on(&conn, &[2], false).unwrap(), 1);
+        assert_eq!(AFile::set_hidden_on(&conn, &[2], false).unwrap(), 0);
+        let flags: Vec<i64> = conn
+            .prepare("SELECT is_hidden FROM afiles ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(flags, vec![1, 0, 0, 0]);
     }
 }

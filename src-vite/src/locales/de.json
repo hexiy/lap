@@ -452,7 +452,8 @@
       "back": "Zurück",
       "scanning": "Scanne…",
       "scan_paused": "Scan pausiert",
-      "scan_queued": "Scan anstehend"
+      "scan_queued": "Scan anstehend",
+      "show_hidden": "Ausgeblendete Fotos anzeigen"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "Festlegen als",
       "set_desktop_wallpaper": "Als Desktop-Hintergrund festlegen",
       "show_info": "Info anzeigen",
-      "remove_from_collection": "Aus Sammlung entfernen"
+      "remove_from_collection": "Aus Sammlung entfernen",
+      "hide": "Ausblenden",
+      "unhide": "Einblenden"
     },
     "calendar": {
       "monthly": "Monatlich",
@@ -1609,5 +1612,16 @@
         "failed_install": "Fehler beim Installieren des Updates"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "Ausgeblendete Fotos entsperren",
+    "enter_pin": "PIN eingeben, um ausgeblendete Fotos anzuzeigen.",
+    "create_pin": "Erstelle eine PIN, um ausgeblendete Fotos zu schützen.",
+    "pin": "PIN",
+    "pin_confirm": "PIN bestätigen",
+    "unlock": "Entsperren",
+    "create": "Erstellen",
+    "wrong_pin": "Falsche PIN.",
+    "pin_mismatch": "PINs stimmen nicht überein."
   }
 }

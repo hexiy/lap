@@ -248,6 +248,7 @@ import {
   IconStarFilled,
   IconFlagFilled,
   IconFlagOff,
+  IconHide,
   IconLivePhoto
 } from '@/common/icons';
 
@@ -695,6 +696,16 @@ const statusBadges = computed<ThumbnailBadge[]>(() => {
     : cullingFlag === 2
       ? 'text-error'
       : undefined;
+
+  // Only reachable while the grid is in reveal mode — hidden files are
+  // excluded from every other list by the backend.
+  if (props.file.is_hidden) {
+    badges.push({
+      key: 'hidden',
+      icon: IconHide,
+      iconClass: 'text-warning',
+    });
+  }
 
   if (props.file.is_favorite) {
     badges.push({

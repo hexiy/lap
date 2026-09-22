@@ -16,6 +16,7 @@ use tauri_plugin_aptabase::EventTracker;
 mod t_ai;
 mod t_ai_png;
 mod t_apple_sidecar;
+mod t_auth;
 mod t_cluster;
 mod t_cmds;
 mod t_common;
@@ -363,6 +364,13 @@ async fn main() {
             t_cmds::set_file_rating,
             t_cmds::set_file_culling_flag,
             t_cmds::batch_update_file_metadata,
+            t_cmds::set_files_hidden,
+            t_auth::hidden_unlock_state,
+            t_auth::unlock_hidden,
+            t_auth::lock_hidden,
+            t_auth::hidden_pin_status,
+            t_auth::set_hidden_pin,
+            t_auth::verify_hidden_pin,
             // tag
             t_cmds::get_tag_group_name,
             t_cmds::get_tag_groups,
@@ -453,8 +461,8 @@ async fn main() {
                 tauri::RunEvent::Exit { .. } => {
                     if aptabase_enabled {
                         let _ = app_handle.track_event("app_exited", None);
+                        app_handle.flush_events_blocking();
                     }
-                    app_handle.flush_events_blocking();
                 }
 
                 // macOS: clicking the Dock icon of a running app reopens it.

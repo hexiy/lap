@@ -452,7 +452,8 @@
       "back": "뒤로",
       "scanning": "스캔 중…",
       "scan_paused": "스캔 일시 중지",
-      "scan_queued": "스캔 대기 중"
+      "scan_queued": "스캔 대기 중",
+      "show_hidden": "숨겨진 사진 표시"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "다음으로 설정",
       "set_desktop_wallpaper": "바탕 화면 배경으로 설정",
       "show_info": "정보 보기",
-      "remove_from_collection": "컬렉션에서 제거"
+      "remove_from_collection": "컬렉션에서 제거",
+      "hide": "숨기기",
+      "unhide": "숨기기 해제"
     },
     "calendar": {
       "monthly": "월별",
@@ -1609,5 +1612,16 @@
         "failed_install": "업데이트 설치 실패"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "숨겨진 사진 잠금 해제",
+    "enter_pin": "숨겨진 사진을 표시하려면 PIN을 입력하세요.",
+    "create_pin": "숨겨진 사진을 보호할 PIN을 만드세요.",
+    "pin": "PIN",
+    "pin_confirm": "PIN 확인",
+    "unlock": "잠금 해제",
+    "create": "만들기",
+    "wrong_pin": "PIN이 올바르지 않습니다.",
+    "pin_mismatch": "PIN이 일치하지 않습니다."
   }
 }

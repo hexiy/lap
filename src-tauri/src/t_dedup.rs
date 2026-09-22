@@ -278,6 +278,7 @@ fn get_files_by_sizes(conn: &Connection) -> Result<Vec<AFile>, String> {
          WHERE a.id NOT IN (
              SELECT live_photo_video_id FROM afiles WHERE live_photo_video_id IS NOT NULL
          )
+         AND COALESCE(a.is_hidden, 0) = 0
          AND a.size IN (
              SELECT size FROM afiles
              WHERE id NOT IN (
@@ -348,6 +349,7 @@ fn get_files_by_sizes(conn: &Connection) -> Result<Vec<AFile>, String> {
                 live_photo_video_id: None,
                 live_photo_video_path: None,
                 motion_photo_offset: None,
+                is_hidden: None,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -651,8 +653,9 @@ pub fn get_overview() -> Result<DedupOverview, String> {
              FROM (
                 SELECT file_size,
                        (SELECT COUNT(*)
-                        FROM duplicate_group_items
-                        WHERE group_id = duplicate_groups.id) AS current_file_count
+                        FROM duplicate_group_items dgi
+                        JOIN afiles af ON af.id = dgi.file_id
+                        WHERE dgi.group_id = duplicate_groups.id AND COALESCE(af.is_hidden, 0) = 0) AS current_file_count
                 FROM duplicate_groups
              )
              WHERE current_file_count > 1",
@@ -685,27 +688,31 @@ pub fn list_groups(
         _ => "cur_size DESC",
     };
 
+    // Only non-hidden files count as group members in the UI.
+    let visible_member_count = "(SELECT COUNT(*) FROM duplicate_group_items dgi JOIN afiles af ON af.id = dgi.file_id WHERE dgi.group_id = duplicate_groups.id AND COALESCE(af.is_hidden, 0) = 0)";
     let filter_clause = match filter {
         "unreviewed" => {
-            "WHERE reviewed = 0 AND (SELECT COUNT(*) FROM duplicate_group_items WHERE group_id = duplicate_groups.id) > 1"
+            format!("WHERE reviewed = 0 AND {} > 1", visible_member_count)
         }
         "reviewed" => {
-            "WHERE reviewed = 1 AND (SELECT COUNT(*) FROM duplicate_group_items WHERE group_id = duplicate_groups.id) > 1"
+            format!("WHERE reviewed = 1 AND {} > 1", visible_member_count)
         }
         _ => {
-            "WHERE (SELECT COUNT(*) FROM duplicate_group_items WHERE group_id = duplicate_groups.id) > 1"
+            format!("WHERE {} > 1", visible_member_count)
         }
     };
 
     let query = format!(
-        "SELECT id, hash, file_size, 
-                (SELECT COUNT(*) FROM duplicate_group_items WHERE group_id = duplicate_groups.id) as cur_count,
-                ((SELECT COUNT(*) FROM duplicate_group_items WHERE group_id = duplicate_groups.id) * file_size) as cur_size,
+        "SELECT id, hash, file_size,
+                {} as cur_count,
+                ({} * file_size) as cur_size,
                 reviewed, updated_at
          FROM duplicate_groups
          {}
          ORDER BY {}
          {}",
+        visible_member_count,
+        visible_member_count,
         filter_clause,
         order_clause,
         if page_size == 0 { "" } else { "LIMIT ?1 OFFSET ?2" }
@@ -750,6 +757,7 @@ fn get_group_items(conn: &Connection, group_id: i64) -> Result<Vec<DedupGroupIte
             "SELECT group_id, file_id, is_keep, is_selected, score
          FROM duplicate_group_items
          WHERE group_id = ?1
+           AND file_id IN (SELECT id FROM afiles WHERE COALESCE(is_hidden, 0) = 0)
          ORDER BY is_keep DESC, score DESC",
         )
         .map_err(|e| e.to_string())?;

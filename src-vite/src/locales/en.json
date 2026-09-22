@@ -452,7 +452,8 @@
       "back": "Back",
       "scanning": "Scanning…",
       "scan_paused": "Scan paused",
-      "scan_queued": "Queued for scan"
+      "scan_queued": "Queued for scan",
+      "show_hidden": "Show hidden photos"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "Set as",
       "set_desktop_wallpaper": "Set as desktop wallpaper",
       "show_info": "Show info",
-      "remove_from_collection": "Remove from Collection"
+      "remove_from_collection": "Remove from Collection",
+      "hide": "Hide",
+      "unhide": "Unhide"
     },
     "calendar": {
       "monthly": "Monthly",
@@ -1609,5 +1612,16 @@
         "failed_install": "Failed to install update"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "Unlock hidden photos",
+    "enter_pin": "Enter your PIN to show hidden photos.",
+    "create_pin": "Create a PIN to protect hidden photos.",
+    "pin": "PIN",
+    "pin_confirm": "Confirm PIN",
+    "unlock": "Unlock",
+    "create": "Create",
+    "wrong_pin": "Wrong PIN.",
+    "pin_mismatch": "PINs do not match."
   }
 }

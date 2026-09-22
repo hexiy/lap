@@ -456,6 +456,7 @@ pub fn list_groups(scope_key: &str, limit: i64, offset: i64) -> Result<serde_jso
                 FROM similarity_groups g
                 JOIN similarity_scans s ON s.id = g.scan_id
                 JOIN similarity_group_items i ON i.group_id = g.id
+                JOIN afiles af ON af.id = i.file_id AND COALESCE(af.is_hidden, 0) = 0
                 WHERE s.scope_key = ?1
                 GROUP BY g.id
                 HAVING COUNT(i.file_id) > 1
@@ -470,6 +471,7 @@ pub fn list_groups(scope_key: &str, limit: i64, offset: i64) -> Result<serde_jso
              FROM similarity_groups g
              JOIN similarity_scans s ON s.id = g.scan_id
              JOIN similarity_group_items i ON i.group_id = g.id
+             JOIN afiles af ON af.id = i.file_id AND COALESCE(af.is_hidden, 0) = 0
              WHERE s.scope_key = ?1
              GROUP BY g.id
              HAVING COUNT(i.file_id) > 1
@@ -505,6 +507,7 @@ pub fn get_overview(scope_key: &str) -> Result<serde_json::Value, String> {
              JOIN similarity_scans s ON s.id = g.scan_id
              JOIN afiles a ON a.id = i.file_id
              WHERE s.scope_key = ?1
+               AND COALESCE(a.is_hidden, 0) = 0
                AND (SELECT COUNT(*) FROM similarity_group_items WHERE group_id = i.group_id) > 1",
             params![scope_key],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
@@ -530,7 +533,7 @@ pub fn get_group(group_id: i64, scope_key: &str) -> Result<serde_json::Value, St
     }
     let mut stmt = conn
         .prepare(
-            "SELECT file_id, score, is_keep FROM similarity_group_items WHERE group_id=?1 ORDER BY is_keep DESC, score DESC, file_id ASC",
+            "SELECT file_id, score, is_keep FROM similarity_group_items WHERE group_id=?1 AND file_id IN (SELECT id FROM afiles WHERE COALESCE(is_hidden, 0) = 0) ORDER BY is_keep DESC, score DESC, file_id ASC",
         )
         .map_err(|e| e.to_string())?;
     let items = stmt.query_map(params![group_id], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?, row.get::<_, i64>(2)?))).map_err(|e| e.to_string())?

@@ -14,6 +14,20 @@ English | [Deutsch](i18n/README.de.md) | [Français](i18n/README.fr.md) | [Espa�
 Lap is an open-source, local-first photo manager for browsing family albums, finding old photos quickly, and managing large personal media libraries offline.
 It is a privacy-focused alternative to cloud photo services: no forced upload, local AI search, folder-first workflow, and free to use.
 
+> **This is a fork of [julyx10/lap](https://github.com/julyx10/lap).** Its only purpose is to add **hidden (password-protected) photos**. Everything else tracks upstream.
+
+## Hidden photos (fork feature)
+
+- **Hide files**: right-click a photo or a selection → **Hide** (below "Set as"). Hidden files disappear from every surface: grid, albums, tags, calendar, people, camera, locations, collections, smart albums, map, search, similar images, and duplicate detection.
+- **Reveal them**: the eye toggle in the toolbar — enabled only in the Albums and Library panes — asks for **Touch ID / Mac password** on macOS, **Windows Hello** on Windows, or an **app PIN** elsewhere, then shows *only* the hidden photos in the current view. Click again to go back; it also re-locks automatically when you navigate to another view and on every app restart.
+- **Unhide**: right-click a hidden photo inside the hidden-only view → **Unhide**.
+
+Notes on the security model and official-app coexistence:
+
+- This is a **visibility flag, not encryption** — hidden files stay untouched on disk. It protects against someone browsing your library inside the app.
+- Hidden state is stored as an additive `is_hidden` column in the shared `afiles` table, added without a numbered migration. The **official Lap app can open the same library safely**: it ignores the column, preserves it through scans/moves/refreshes, and its migrations apply normally. Hidden files will simply appear normal in the official app.
+- The fallback PIN is stored as a salted iterated hash in `hidden_pin.json` inside the fork's own app-data directory — never in the shared library config.
+
 ## Download Lap
 
 Open the [latest release page](https://github.com/julyx10/lap/releases/latest), then download the file that matches your system:

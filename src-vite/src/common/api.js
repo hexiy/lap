@@ -1521,6 +1521,75 @@ export async function batchUpdateFileMetadata(params) {
   }
 }
 
+// hidden photos
+
+// hide or unhide files; returns the number of rows actually changed
+export async function setFilesHidden(fileIds, hidden) {
+  try {
+    const result = await invoke('set_files_hidden', { fileIds, hidden });
+    if (result !== null && result !== undefined) {
+      return result;
+    }
+  } catch (error) {
+    console.error('Failed to set hidden flag:', error);
+  }
+  return null;
+}
+
+// try OS-level auth (Touch ID / Windows Hello); result:
+// { status: 'unlocked' | 'pin_required' | 'cancelled', pinConfigured: bool }
+export async function unlockHiddenPhotos() {
+  try {
+    return await invoke('unlock_hidden');
+  } catch (error) {
+    console.error('Failed to unlock hidden photos:', error);
+    return { status: 'cancelled', pinConfigured: false };
+  }
+}
+
+export async function lockHiddenPhotos() {
+  try {
+    await invoke('lock_hidden');
+  } catch (error) {
+    console.error('Failed to lock hidden photos:', error);
+  }
+}
+
+export async function getHiddenUnlockState() {
+  try {
+    return Boolean(await invoke('hidden_unlock_state'));
+  } catch (error) {
+    return false;
+  }
+}
+
+export async function getHiddenPinStatus() {
+  try {
+    return Boolean(await invoke('hidden_pin_status'));
+  } catch (error) {
+    return false;
+  }
+}
+
+export async function setHiddenPin(pin) {
+  try {
+    await invoke('set_hidden_pin', { pin });
+    return true;
+  } catch (error) {
+    console.error('Failed to set hidden PIN:', error);
+    return String(error);
+  }
+}
+
+export async function verifyHiddenPin(pin) {
+  try {
+    return Boolean(await invoke('verify_hidden_pin', { pin }));
+  } catch (error) {
+    console.error('Failed to verify hidden PIN:', error);
+    return false;
+  }
+}
+
 // tags
 
 export async function getTagGroupName(id) {

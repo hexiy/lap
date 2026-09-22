@@ -2878,6 +2878,14 @@ pub fn batch_update_file_metadata(params: BatchFileMetadataUpdate) -> Result<usi
     .map_err(|e| format!("Error while updating file metadata: {}", e))
 }
 
+/// Hide or unhide files. Dedicated path: `is_hidden` is never written by
+/// refresh/rescan code, so the flag survives official-app alternation.
+#[tauri::command]
+pub fn set_files_hidden(file_ids: Vec<i64>, hidden: bool) -> Result<usize, String> {
+    AFile::set_hidden(&file_ids, hidden)
+        .map_err(|e| format!("Error while setting hidden flag: {}", e))
+}
+
 // tag
 
 #[tauri::command]

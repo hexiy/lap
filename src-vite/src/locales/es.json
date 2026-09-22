@@ -452,7 +452,8 @@
       "back": "Volver",
       "scanning": "Escaneando…",
       "scan_paused": "Escaneo pausado",
-      "scan_queued": "En cola para escanear"
+      "scan_queued": "En cola para escanear",
+      "show_hidden": "Mostrar fotos ocultas"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "Establecer como",
       "set_desktop_wallpaper": "Establecer como fondo de escritorio",
       "show_info": "Ver info",
-      "remove_from_collection": "Quitar de la colección"
+      "remove_from_collection": "Quitar de la colección",
+      "hide": "Ocultar",
+      "unhide": "Mostrar"
     },
     "calendar": {
       "monthly": "Mensual",
@@ -1609,5 +1612,16 @@
         "failed_install": "Error al instalar la actualización"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "Desbloquear fotos ocultas",
+    "enter_pin": "Introduce tu PIN para mostrar las fotos ocultas.",
+    "create_pin": "Crea un PIN para proteger las fotos ocultas.",
+    "pin": "PIN",
+    "pin_confirm": "Confirmar PIN",
+    "unlock": "Desbloquear",
+    "create": "Crear",
+    "wrong_pin": "PIN incorrecto.",
+    "pin_mismatch": "Los PIN no coinciden."
   }
 }

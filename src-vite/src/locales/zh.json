@@ -452,7 +452,8 @@
       "back": "返回",
       "scanning": "扫描中…",
       "scan_paused": "扫描已暂停",
-      "scan_queued": "排队等待扫描"
+      "scan_queued": "排队等待扫描",
+      "show_hidden": "显示隐藏的照片"
     }
   },
   "info_panel": {
@@ -681,7 +682,9 @@
       "set_as": "设为",
       "set_desktop_wallpaper": "设为桌面壁纸",
       "show_info": "显示信息",
-      "remove_from_collection": "从合集移除"
+      "remove_from_collection": "从合集移除",
+      "hide": "隐藏",
+      "unhide": "取消隐藏"
     },
     "calendar": {
       "monthly": "按月",
@@ -1609,5 +1612,16 @@
         "failed_install": "安装更新失败"
       }
     }
+  },
+  "hidden": {
+    "unlock_title": "解锁隐藏的照片",
+    "enter_pin": "输入密码以显示隐藏的照片。",
+    "create_pin": "创建一个密码来保护隐藏的照片。",
+    "pin": "密码",
+    "pin_confirm": "确认密码",
+    "unlock": "解锁",
+    "create": "创建",
+    "wrong_pin": "密码错误。",
+    "pin_mismatch": "两次输入的密码不一致。"
   }
 }

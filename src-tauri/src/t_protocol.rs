@@ -1,6 +1,6 @@
 use tauri::{Builder, Wry};
 
-use crate::{t_image, t_sqlite};
+use crate::{t_auth, t_image, t_sqlite};
 
 fn text_response(status: http::StatusCode, body: &str) -> http::Response<Vec<u8>> {
     http::Response::builder()
@@ -97,6 +97,12 @@ pub fn register_protocols(builder: Builder<Wry>) -> Builder<Wry> {
                 return;
             }
 
+            // Hidden files are not served while the session is locked.
+            if t_sqlite::AFile::is_hidden(file_id) && !t_auth::is_unlocked() {
+                responder.respond(text_response(http::StatusCode::NOT_FOUND, "not found"));
+                return;
+            }
+
             let app_handle = _ctx.app_handle().clone();
             tauri::async_runtime::spawn(async move {
                 let response = match t_sqlite::AThumb::fetch_raw_for_library(file_id, &library_id) {
@@ -154,6 +160,12 @@ pub fn register_protocols(builder: Builder<Wry>) -> Builder<Wry> {
                     return;
                 }
             };
+
+            // Hidden files are not served while the session is locked.
+            if file.is_hidden == Some(true) && !t_auth::is_unlocked() {
+                responder.respond(text_response(http::StatusCode::NOT_FOUND, "file not found"));
+                return;
+            }
 
             let file_path = match file.file_path {
                 Some(path) if !path.is_empty() => path,
