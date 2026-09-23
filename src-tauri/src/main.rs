@@ -42,9 +42,77 @@ mod t_storage;
 mod t_utils;
 mod t_video;
 
+/// Route stdout/stderr into ~/Library/Logs/Lap/lap.log with per-line
+/// timestamps when the app is launched from Finder (stdout is /dev/null
+/// there, so println!/eprintln! output is otherwise discarded). When run
+/// from a terminal, logging is left untouched and prints inline.
+#[cfg(target_os = "macos")]
+fn init_file_logging() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::fd::FromRawFd;
+
+    if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1 {
+        return;
+    }
+
+    let Some(log_dir) = dirs::home_dir().map(|home| home.join("Library/Logs/Lap")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&log_dir).is_err() {
+        return;
+    }
+    let log_path = log_dir.join("lap.log");
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > 32 * 1024 * 1024 {
+            let _ = std::fs::rename(&log_path, log_dir.join("lap.log.1"));
+        }
+    }
+    // Open the destination file before touching the descriptors: if this
+    // fails, stdout/stderr stay as they were instead of pointing at a pipe
+    // with no reader.
+    let mut log_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return;
+    }
+    unsafe {
+        libc::dup2(pipe_fds[1], libc::STDOUT_FILENO);
+        libc::dup2(pipe_fds[1], libc::STDERR_FILENO);
+        libc::close(pipe_fds[1]);
+    }
+    std::thread::spawn(move || {
+        let reader = unsafe { std::fs::File::from_raw_fd(pipe_fds[0]) };
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                    let _ = writeln!(log_file, "[{ts}] {}", line.trim_end());
+                }
+            }
+        }
+    });
+    println!("==== Lap started ====");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn init_file_logging() {}
+
 /// The main function is the entry point for the Tauri application.
 #[tokio::main]
 async fn main() {
+    init_file_logging();
+
     std::panic::set_hook(Box::new(|panic_info| {
         eprintln!("Unhandled panic: {}", panic_info);
     }));

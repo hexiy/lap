@@ -14,7 +14,7 @@ English | [Deutsch](i18n/README.de.md) | [Français](i18n/README.fr.md) | [Espa�
 Lap is an open-source, local-first photo manager for browsing family albums, finding old photos quickly, and managing large personal media libraries offline.
 It is a privacy-focused alternative to cloud photo services: no forced upload, local AI search, folder-first workflow, and free to use.
 
-> **This is a fork of [julyx10/lap](https://github.com/julyx10/lap).** Its only purpose is to add **hidden (password-protected) photos**. Everything else tracks upstream.
+> **This is a fork of [julyx10/lap](https://github.com/julyx10/lap).** It adds **hidden (password-protected) photos** and **faster, resumable album scanning**. Everything else tracks upstream.
 
 ## Hidden photos (fork feature)
 
@@ -27,6 +27,16 @@ Notes on the security model and official-app coexistence:
 - This is a **visibility flag, not encryption** — hidden files stay untouched on disk. It protects against someone browsing your library inside the app.
 - Hidden state is stored as an additive `is_hidden` column in the shared `afiles` table, added without a numbered migration. The **official Lap app can open the same library safely**: it ignores the column, preserves it through scans/moves/refreshes, and its migrations apply normally. Hidden files will simply appear normal in the official app.
 - The fallback PIN is stored as a salted iterated hash in `hidden_pin.json` inside the fork's own app-data directory — never in the shared library config.
+
+## Faster, resumable scanning (fork feature)
+
+Album indexing on very large libraries (100k+ files) was made dramatically faster and safe to interrupt:
+
+- **Real resume**: quitting mid-scan persists a traversal cursor (`albums.scan_cursor`, migration 18) instead of reusing the progress counters, which could never match the raw file count on albums with merged Live Photo companions — so an interrupted scan used to restart at 0. Now it continues where it left off.
+- **Interrupted scans no longer destroy data**: previously, files skipped by a resumed scan were never marked as seen, so the end-of-scan stale-file sweep would delete their rows — along with thumbnails and AI embeddings. The skipped prefix is now batch-marked as seen, and the sweep only removes files genuinely gone from disk.
+- **Faster re-verification**: a per-scan folder-id cache, batched `last_scan_time` writes, once-only comment backfill, and a metadata-only thumbnail check remove the per-file SELECT/stat/UPDATE/thumbnail-read that made re-scans crawl.
+- **Parallel embeddings**: the AI vision model loads as a two-session pool instead of a single mutexed session, so search-index generation is no longer strictly serial.
+- **File logging**: when launched from Finder (stdout is `/dev/null`), logs are mirrored to `~/Library/Logs/Lap/lap.log` with timestamps and 32 MB rotation, making release builds debuggable.
 
 ## Download Lap
 

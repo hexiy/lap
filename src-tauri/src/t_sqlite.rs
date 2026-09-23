@@ -140,6 +140,8 @@ pub struct Album {
     pub merged_count: Option<u64>,  // companions merged into logical items
     pub merged_size: Option<u64>,   // total size of merged companions
     pub last_scan_time: Option<i64>,   // last scan time
+    #[serde(default)]
+    pub scan_cursor: Option<i64>, // traversal position persisted for scan resume
     #[serde(default = "default_album_accessible")]
     pub is_accessible: bool,
 }
@@ -177,6 +179,7 @@ impl Album {
             merged_count: Some(0),
             merged_size: Some(0),
             last_scan_time: Some(0),
+            scan_cursor: Some(0),
             is_accessible: true,
         })
     }
@@ -201,6 +204,7 @@ impl Album {
             merged_count: row.get(14)?,
             merged_size: row.get(15)?,
             last_scan_time: row.get(16)?,
+            scan_cursor: row.get(17)?,
             is_accessible: true,
         })
     }
@@ -209,7 +213,7 @@ impl Album {
     fn fetch(path: &str) -> Result<Option<Self>, String> {
         let conn = open_conn()?;
         let result = conn.query_row(
-            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time
+            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time, scan_cursor
             FROM albums WHERE path = ?1",
             params![path],
             Self::from_row
@@ -341,7 +345,7 @@ impl Album {
         let conn = open_conn()?;
 
         let query =
-            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time
+            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time, scan_cursor
             FROM albums
             ORDER BY display_order_id ASC";
 
@@ -367,7 +371,7 @@ impl Album {
     pub fn get_album_by_id(id: i64) -> Result<Self, String> {
         let conn = open_conn()?;
         let result = conn.query_row(
-            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time
+            "SELECT id, name, path, created_at, modified_at, display_order_id, cover_file_id, description, indexed, total, skipped_count, skipped_size, failed_count, failed_size, merged_count, merged_size, last_scan_time, scan_cursor
             FROM albums WHERE id = ?1",
             params![id],
             Self::from_row
@@ -443,6 +447,19 @@ impl Album {
             .execute(
                 "UPDATE albums SET indexed = ?1, total = ?2 WHERE id = ?3",
                 params![indexed, total, id],
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    }
+
+    /// Persist the traversal cursor used to resume an interrupted scan.
+    /// `0` means "no resumable position" (fresh or completed scan).
+    pub fn update_scan_cursor(id: i64, cursor: u64) -> Result<usize, String> {
+        let conn = open_conn()?;
+        let result = conn
+            .execute(
+                "UPDATE albums SET scan_cursor = ?1 WHERE id = ?2",
+                params![cursor as i64, id],
             )
             .map_err(|e| e.to_string())?;
         Ok(result)
@@ -3612,12 +3629,106 @@ impl AFile {
         file_type: i64,
         last_scan_time: i64,
     ) -> Result<(Self, i32), String> {
-        Self::add_to_db_with_raw_info(folder_id, file_path, file_type, last_scan_time, None)
+        Self::add_to_db_inner(folder_id, file_path, file_type, last_scan_time, None, None)
+    }
+
+    /// Scan-path variant: unchanged files push their id into `touch_buffer` so
+    /// the caller can mark `last_scan_time` in one batched transaction instead
+    /// of one autocommitted UPDATE per file.
+    pub fn add_to_db_for_scan(
+        folder_id: i64,
+        file_path: &str,
+        file_type: i64,
+        last_scan_time: i64,
+        touch_buffer: &mut Vec<i64>,
+    ) -> Result<(Self, i32), String> {
+        Self::add_to_db_inner(
+            folder_id,
+            file_path,
+            file_type,
+            last_scan_time,
+            None,
+            Some(touch_buffer),
+        )
+    }
+
+    /// Batch-mark files as seen by the current scan inside one transaction.
+    pub fn touch_last_scan_batch(file_ids: &[i64], scan_time: i64) -> Result<usize, String> {
+        if file_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = open_conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut touched = 0usize;
+        for chunk in file_ids.chunks(500) {
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql =
+                format!("UPDATE afiles SET last_scan_time = ? WHERE id IN ({})", placeholders);
+            let mut args: Vec<i64> = Vec::with_capacity(chunk.len() + 1);
+            args.push(scan_time);
+            args.extend_from_slice(chunk);
+            touched += tx
+                .execute(&sql, rusqlite::params_from_iter(args))
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(touched)
+    }
+
+    /// Batch-mark files by (folder_id, path) pairs — used for the
+    /// already-indexed prefix of a resumed scan, where skipping the per-file
+    /// SELECT is the point. `afiles` stores only the basename in `name`.
+    pub fn touch_by_path_batch(
+        pairs: &[(i64, String)],
+        scan_time: i64,
+    ) -> Result<usize, String> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = open_conn()?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut touched = 0usize;
+        for chunk in pairs.chunks(250) {
+            let marks = std::iter::repeat("(?, ?)")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE afiles SET last_scan_time = ? WHERE (folder_id, name) IN ({})",
+                marks
+            );
+            let mut args: Vec<rusqlite::types::Value> =
+                Vec::with_capacity(chunk.len() * 2 + 1);
+            args.push(rusqlite::types::Value::Integer(scan_time));
+            for (folder_id, path) in chunk {
+                args.push(rusqlite::types::Value::Integer(*folder_id));
+                args.push(rusqlite::types::Value::Text(t_utils::get_file_name(path)));
+            }
+            touched += tx
+                .execute(&sql, rusqlite::params_from_iter(args))
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(touched)
     }
 
     pub fn add_to_db_with_raw_info(
         folder_id: i64, file_path: &str, file_type: i64, last_scan_time: i64,
         raw_info: Option<t_libraw::RawInfo>,
+    ) -> Result<(Self, i32), String> {
+        Self::add_to_db_inner(folder_id, file_path, file_type, last_scan_time, raw_info, None)
+    }
+
+    fn add_to_db_inner(
+        folder_id: i64,
+        file_path: &str,
+        file_type: i64,
+        last_scan_time: i64,
+        raw_info: Option<t_libraw::RawInfo>,
+        touch_buffer: Option<&mut Vec<i64>>,
     ) -> Result<(Self, i32), String> {
         // Check if the file exists
         let existing_file = Self::fetch(folder_id, file_path)?;
@@ -3676,16 +3787,19 @@ impl AFile {
                 // Not modified and thumb exists, but we still need to update last_scan_time
                 // for the mark-and-sweep deletion logic.
                 if let Some(file_id) = file.id {
-                    let _ = Self::update_column(file_id, "last_scan_time", &last_scan_time);
-                    if file
-                        .comments
-                        .as_deref()
-                        .is_none_or(|comment| comment.trim().is_empty())
-                    {
-                        if let Some(comment) = t_ai_png::extract_comment(file_path) {
-                            let _ = Self::update_column(file_id, "comments", &comment);
-                            file.comments = Some(comment);
+                    match touch_buffer {
+                        Some(buffer) => buffer.push(file_id),
+                        None => {
+                            let _ = Self::update_column(file_id, "last_scan_time", &last_scan_time);
                         }
+                    }
+                    // One-time backfill for rows indexed before comment
+                    // extraction existed. Persist "" for "checked, nothing
+                    // found" so unchanged files are not re-read every scan.
+                    if file.comments.is_none() {
+                        let comment = t_ai_png::extract_comment(file_path).unwrap_or_default();
+                        let _ = Self::update_column(file_id, "comments", &comment);
+                        file.comments = Some(comment);
                     }
                 }
             }
@@ -6407,8 +6521,13 @@ impl AFile {
             }
         }
 
-        // 4. Generate embedding
-        let mut engine = state.0.lock().unwrap();
+        // 4. Generate embedding. The vision pool is shared, so only borrow the
+        // engine long enough to clone the Arc — inference then runs on a
+        // pooled session without serializing on the engine mutex.
+        let vision_pool = state.0.lock().unwrap().vision_pool();
+        let Some(vision_pool) = vision_pool else {
+            return Err("AI models not loaded".to_string());
+        };
 
         // Optimized: Use thumbnail if available (much faster than loading original)
         // Fallback to original file if thumbnail is missing or fails to process
@@ -6416,12 +6535,12 @@ impl AFile {
             Ok(Some(thumb)) if thumb.thumb_data.is_some() => {
                 let thumb_bytes = thumb.thumb_data.as_ref().unwrap();
                 match panic::catch_unwind(AssertUnwindSafe(|| {
-                    engine.encode_image_from_bytes(thumb_bytes)
+                    vision_pool.encode_image_from_bytes(thumb_bytes)
                 })) {
                     Ok(res) => res.or_else(|_| {
                         // If thumbnail processing fails (e.g. corrupted), try original
                         match panic::catch_unwind(AssertUnwindSafe(|| {
-                            engine.encode_image(&file_path)
+                            vision_pool.encode_image(&file_path)
                         })) {
                             Ok(res2) => res2,
                             Err(_) => Err(format!(
@@ -6432,7 +6551,7 @@ impl AFile {
                     }),
                     // If thumbnail path panics, still try original once.
                     Err(_) => match panic::catch_unwind(AssertUnwindSafe(|| {
-                        engine.encode_image(&file_path)
+                        vision_pool.encode_image(&file_path)
                     })) {
                         Ok(res2) => res2,
                         Err(_) => Err(format!(
@@ -6442,7 +6561,9 @@ impl AFile {
                     },
                 }
             }
-            _ => match panic::catch_unwind(AssertUnwindSafe(|| engine.encode_image(&file_path))) {
+            _ => match panic::catch_unwind(AssertUnwindSafe(|| {
+                vision_pool.encode_image(&file_path)
+            })) {
                 Ok(res) => res,
                 Err(_) => Err(format!(
                     "Embedding panic while encoding original image: {}",
@@ -7315,44 +7436,54 @@ impl AThumb {
         }
     }
 
-    /// Whether an explicit album re-scan should regenerate this thumbnail at
-    /// the currently selected size and RAW thumbnail source.
-    pub fn needs_thumbnail_regeneration(
-        file_id: i64,
+    /// Scan-path regeneration check: reuses the already-fetched `AFile` row and
+    /// reads only `athumbs` metadata (no thumbnail bytes, no extra file row
+    /// fetch, no source stat beyond what the scan already did).
+    pub fn needs_thumbnail_regeneration_for_file(
+        file: &AFile,
         thumbnail_size: u32,
         prefer_embedded_raw_thumbnail: bool,
+        library_id: &str,
     ) -> bool {
-        Self::fetch(file_id)
-            .ok()
-            .flatten()
-            .is_some_and(|thumbnail| {
-                if thumbnail.error_code == 2 {
+        let Some(file_id) = file.id else { return false };
+        let Ok(conn) = open_conn() else { return false };
+        let thumb = conn
+            .query_row(
+                "SELECT error_code, thumb_key, thumb_size FROM athumbs WHERE file_id = ?1",
+                params![file_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional();
+        match thumb {
+            Ok(Some((error_code, thumb_key, thumb_size_cached))) => {
+                if error_code == 2 {
                     return false;
                 }
-
-                let size_changed = thumbnail.thumb_size != Some(thumbnail_size as i64);
-
-                let Ok(Some(file)) = AFile::get_file_info(file_id) else {
-                    return size_changed;
-                };
+                let size_changed = thumb_size_cached != Some(thumbnail_size as i64);
                 if file.file_type.unwrap_or(0) != 3 {
                     return size_changed;
                 }
-
                 if size_changed {
                     return true;
                 }
-
                 let expected_key = Self::build_thumb_key(
-                    &Self::get_current_library_id(),
+                    library_id,
                     file_id,
                     thumbnail_size,
-                    file.file_path.as_deref().and_then(Self::get_source_mtime),
+                    file.modified_at,
                     file.e_orientation.unwrap_or(1) as i32,
                     Some(prefer_embedded_raw_thumbnail),
                 );
-                thumbnail.thumb_key.as_deref() != Some(expected_key.as_str())
-            })
+                thumb_key.as_deref() != Some(expected_key.as_str())
+            }
+            _ => false,
+        }
     }
 
     fn fetch_thumb_key(file_id: i64) -> Result<Option<String>, String> {
@@ -9565,7 +9696,8 @@ fn create_db_internal() -> Result<(), String> {
             failed_size INTEGER NOT NULL DEFAULT 0,
             merged_count INTEGER NOT NULL DEFAULT 0,
             merged_size INTEGER NOT NULL DEFAULT 0,
-            last_scan_time INTEGER DEFAULT 0
+            last_scan_time INTEGER DEFAULT 0,
+            scan_cursor INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )

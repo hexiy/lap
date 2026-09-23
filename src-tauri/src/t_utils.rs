@@ -3421,7 +3421,9 @@ impl ProcessingBudget {
         Self {
             normal_thumb: Arc::new(Semaphore::new(normal_budget)),
             heavy_thumb: Arc::new(Semaphore::new(heavy_budget)),
-            embedding: Arc::new(Semaphore::new(1)),
+            // Matches VISION_SESSION_COUNT in t_ai — the pooled sessions are
+            // the real limit; extra permits would just queue inside.
+            embedding: Arc::new(Semaphore::new(2)),
         }
     }
 }
@@ -3492,13 +3494,15 @@ impl ProgressTracker {
         total: u64,
         search_total: u64,
         discovered: u64,
+        processed: u64,
+        search_ready: u64,
         scan_total: u64,
         scan_total_size: u64,
     ) -> Self {
         let snapshot = ProgressSnapshot {
             discovered,
-            processed: 0,
-            search_ready: 0,
+            processed,
+            search_ready,
             total,
             search_total,
             current_size: 0,
@@ -3593,6 +3597,53 @@ fn should_use_heavy_lane(
     pixel_count >= 40_000_000 || width >= 8000 || height >= 8000
 }
 
+/// Resolve (creating if needed) the afolders row for `parent_path`, with a
+/// per-scan cache so the common repeat-hit costs no SELECT/stat/UPDATE.
+fn resolve_folder_id(
+    album_id: i64,
+    parent_path: &str,
+    cache: &mut HashMap<String, i64>,
+) -> Option<i64> {
+    if let Some(id) = cache.get(parent_path) {
+        return Some(*id);
+    }
+    match crate::t_sqlite::AFolder::add_to_db(album_id, parent_path) {
+        Ok(folder) => match folder.id {
+            Some(id) => {
+                cache.insert(parent_path.to_string(), id);
+                Some(id)
+            }
+            None => {
+                eprintln!("Indexed folder has no id, skipping file: {}", parent_path);
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// Flush pending `last_scan_time` writes and persist the traversal cursor so a
+/// quit/crash mid-scan can resume. `force` flushes regardless of cadence.
+fn flush_scan_progress(
+    album_id: i64,
+    traversed_count: u64,
+    last_cursor_write: &mut u64,
+    touch_buffer: &mut Vec<i64>,
+    prefix_touch: &mut Vec<(i64, String)>,
+    scan_time: i64,
+    force: bool,
+) {
+    if !force && traversed_count.saturating_sub(*last_cursor_write) < 500 {
+        return;
+    }
+    let _ = crate::t_sqlite::AFile::touch_last_scan_batch(touch_buffer, scan_time);
+    touch_buffer.clear();
+    let _ = crate::t_sqlite::AFile::touch_by_path_batch(prefix_touch, scan_time);
+    prefix_touch.clear();
+    let _ = Album::update_scan_cursor(album_id, traversed_count);
+    *last_cursor_write = traversed_count;
+}
+
 fn index_single_file(
     album_path: &str,
     album_id: i64,
@@ -3601,6 +3652,9 @@ fn index_single_file(
     thumbnail_size: u32,
     prefer_embedded_raw_thumbnail: bool,
     last_scan_time: i64,
+    folder_id_cache: &mut HashMap<String, i64>,
+    touch_buffer: &mut Vec<i64>,
+    library_id: &str,
 ) -> Option<FileIndexOutcome> {
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let parent_path = Path::new(path_str)
@@ -3609,70 +3663,71 @@ fn index_single_file(
             .to_string_lossy()
             .to_string();
 
-        if let Ok(folder) = crate::t_sqlite::AFolder::add_to_db(album_id, &parent_path) {
-            if let Some(folder_id) = folder.id {
-                if let Ok((file, _)) =
-                    crate::t_sqlite::AFile::add_to_db(folder_id, path_str, ftype, last_scan_time)
-                {
-                    if let Some(file_id) = file.id {
-                        let has_thumbnail = file.has_thumbnail.unwrap_or(false);
-                        let needs_thumbnail_regeneration = has_thumbnail
-                            && crate::t_sqlite::AThumb::needs_thumbnail_regeneration(
-                                file_id,
-                                thumbnail_size,
-                                prefer_embedded_raw_thumbnail,
-                            );
-                        let thumbnail_ready = has_thumbnail && !needs_thumbnail_regeneration;
-                        let has_embedding = file.has_embedding.unwrap_or(false);
-                        let processed_immediately = thumbnail_ready;
-                        let search_ready_immediately = match ftype {
-                            1 | 3 => thumbnail_ready && has_embedding,
-                            _ => false,
-                        };
-                        let fully_indexed = match ftype {
-                            1 | 3 => search_ready_immediately,
-                            2 => processed_immediately,
-                            _ => false,
-                        };
-
-                        let task = if fully_indexed {
-                            None
-                        } else {
-                            Some(ThumbnailTask {
-                                file_id,
-                                file_path: path_str.to_string(),
-                                file_type: ftype,
-                                orientation: file.e_orientation.unwrap_or(1) as i32,
-                                thumbnail_size,
-                                prefer_embedded_raw_thumbnail,
-                                file_size: file.size.max(0) as u64,
-                                duration: file.duration.map(|d| d as u64),
-                                is_heavy: should_use_heavy_lane(
-                                    ftype,
-                                    path_str,
-                                    file.size.max(0) as u64,
-                                    file.width.unwrap_or(0),
-                                    file.height.unwrap_or(0),
-                                ),
-                                processed_already_ready: thumbnail_ready,
-                                force_regenerate: needs_thumbnail_regeneration,
-                            })
-                        };
-
-                        return Some(FileIndexOutcome {
-                            task,
-                            processed_immediately,
-                            search_ready_immediately,
-                        });
-                    } else {
-                        eprintln!(
-                            "Indexed file has no id, skipping follow-up tasks: {}",
-                            path_str
+        if let Some(folder_id) = resolve_folder_id(album_id, &parent_path, folder_id_cache) {
+            if let Ok((file, _)) = crate::t_sqlite::AFile::add_to_db_for_scan(
+                folder_id,
+                path_str,
+                ftype,
+                last_scan_time,
+                touch_buffer,
+            ) {
+                if let Some(file_id) = file.id {
+                    let has_thumbnail = file.has_thumbnail.unwrap_or(false);
+                    let needs_thumbnail_regeneration = has_thumbnail
+                        && crate::t_sqlite::AThumb::needs_thumbnail_regeneration_for_file(
+                            &file,
+                            thumbnail_size,
+                            prefer_embedded_raw_thumbnail,
+                            library_id,
                         );
-                    }
+                    let thumbnail_ready = has_thumbnail && !needs_thumbnail_regeneration;
+                    let has_embedding = file.has_embedding.unwrap_or(false);
+                    let processed_immediately = thumbnail_ready;
+                    let search_ready_immediately = match ftype {
+                        1 | 3 => thumbnail_ready && has_embedding,
+                        _ => false,
+                    };
+                    let fully_indexed = match ftype {
+                        1 | 3 => search_ready_immediately,
+                        2 => processed_immediately,
+                        _ => false,
+                    };
+
+                    let task = if fully_indexed {
+                        None
+                    } else {
+                        Some(ThumbnailTask {
+                            file_id,
+                            file_path: path_str.to_string(),
+                            file_type: ftype,
+                            orientation: file.e_orientation.unwrap_or(1) as i32,
+                            thumbnail_size,
+                            prefer_embedded_raw_thumbnail,
+                            file_size: file.size.max(0) as u64,
+                            duration: file.duration.map(|d| d as u64),
+                            is_heavy: should_use_heavy_lane(
+                                ftype,
+                                path_str,
+                                file.size.max(0) as u64,
+                                file.width.unwrap_or(0),
+                                file.height.unwrap_or(0),
+                            ),
+                            processed_already_ready: thumbnail_ready,
+                            force_regenerate: needs_thumbnail_regeneration,
+                        })
+                    };
+
+                    return Some(FileIndexOutcome {
+                        task,
+                        processed_immediately,
+                        search_ready_immediately,
+                    });
+                } else {
+                    eprintln!(
+                        "Indexed file has no id, skipping follow-up tasks: {}",
+                        path_str
+                    );
                 }
-            } else {
-                eprintln!("Indexed folder has no id, skipping file: {}", parent_path);
             }
         }
         None
@@ -3844,16 +3899,19 @@ pub async fn index_album_worker(
     let total_files = image_count + video_count;
     let search_total = image_count;
 
-    // Resume only when totals match and previous indexed is a valid in-progress value.
-    // This avoids breaking normal re-scan behavior after a completed run.
-    let resume_from = if previous_total == total_files
-        && previous_indexed > 0
-        && previous_indexed < total_files
-    {
-        previous_indexed
-    } else {
-        0
-    };
+    // Resume from the persisted traversal cursor: the number of media files
+    // (in WalkDir order) the previous incomplete scan already visited. Unlike
+    // indexed/total this survives recounts and Live Photo merges, and unlike a
+    // completed album it is only nonzero when the last traversal was
+    // interrupted. Files in the prefix are still marked as seen (batched) so
+    // the end-of-scan mark-and-sweep cannot delete them.
+    let resume_from = (album.scan_cursor.unwrap_or(0).max(0) as u64).min(total_files);
+    if resume_from > 0 {
+        println!(
+            "[scan] album={} resuming at cursor {} of {} files",
+            album_id, resume_from, total_files
+        );
+    }
 
     // 3. Emit start progress
     let tracker = Arc::new(Mutex::new(ProgressTracker::new(
@@ -3862,13 +3920,25 @@ pub async fn index_album_worker(
         total_files,
         search_total,
         resume_from,
+        resume_from,
+        resume_from.min(search_total),
         scan_total,
         scan_total_size,
     )));
     with_progress_tracker(&tracker, |tracker| tracker.emit_now());
 
     // update progress to db
-    let _ = Album::update_progress(album_id, 0, total_files);
+    let _ = Album::update_progress(album_id, resume_from, total_files);
+
+    // Per-scan folder-id cache and pending last_scan_time writes (flushed in
+    // batches alongside the scan cursor).
+    let library_id = crate::t_config::load_app_config()
+        .map(|config| config.current_library_id)
+        .unwrap_or_else(|_| "default".to_string());
+    let mut folder_id_cache: HashMap<String, i64> = HashMap::new();
+    let mut touch_buffer: Vec<i64> = Vec::with_capacity(512);
+    let mut prefix_touch: Vec<(i64, String)> = Vec::with_capacity(512);
+    let mut last_cursor_write = 0u64;
 
     // 4. Traverse and index
     let mut is_cancelled = false;
@@ -3943,9 +4013,29 @@ pub async fn index_album_worker(
         if entry.file_type().is_file() {
             let path_str = entry.path().to_string_lossy().to_string();
             if let Some(ftype) = get_file_type(&path_str) {
-                // Resume mode: skip already-indexed prefix files.
+                // Resume mode: skip the already-indexed prefix, but still mark
+                // each file as seen so mark-and-sweep keeps it.
                 if traversed_count < resume_from {
                     traversed_count += 1;
+                    let parent_path = Path::new(&path_str)
+                        .parent()
+                        .unwrap_or(Path::new(&album.path))
+                        .to_string_lossy()
+                        .to_string();
+                    if let Some(folder_id) =
+                        resolve_folder_id(album_id, &parent_path, &mut folder_id_cache)
+                    {
+                        prefix_touch.push((folder_id, path_str.clone()));
+                    }
+                    flush_scan_progress(
+                        album_id,
+                        traversed_count,
+                        &mut last_cursor_write,
+                        &mut touch_buffer,
+                        &mut prefix_touch,
+                        current_scan_time,
+                        false,
+                    );
                     continue;
                 }
 
@@ -3968,6 +4058,15 @@ pub async fn index_album_worker(
                         tracker.maybe_emit();
                     });
                     traversed_count += 1;
+                    flush_scan_progress(
+                        album_id,
+                        traversed_count,
+                        &mut last_cursor_write,
+                        &mut touch_buffer,
+                        &mut prefix_touch,
+                        current_scan_time,
+                        false,
+                    );
                     continue;
                 }
 
@@ -3979,6 +4078,9 @@ pub async fn index_album_worker(
                     thumbnail_size,
                     prefer_embedded_raw_thumbnail,
                     current_scan_time,
+                    &mut folder_id_cache,
+                    &mut touch_buffer,
+                    &library_id,
                 ) {
                     let file_size = outcome
                         .task
@@ -4029,6 +4131,15 @@ pub async fn index_album_worker(
                 }
 
                 traversed_count += 1;
+                flush_scan_progress(
+                    album_id,
+                    traversed_count,
+                    &mut last_cursor_write,
+                    &mut touch_buffer,
+                    &mut prefix_touch,
+                    current_scan_time,
+                    false,
+                );
             } else if !is_ignored_scan_sidecar(entry.path()) {
                 let file_size = entry.metadata().map(|metadata| metadata.len()).unwrap_or(0);
                 with_progress_tracker(&tracker, |tracker| {
@@ -4061,6 +4172,23 @@ pub async fn index_album_worker(
     let mut final_snapshot = with_progress_tracker(&tracker, |tracker| tracker.snapshot());
     let scan_failed = traversal_failed || !directory_accessible(&album.path);
     let scan_complete = !is_cancelled && !scan_failed;
+
+    // Flush pending last_scan_time writes and persist the traversal cursor.
+    // An interrupted scan keeps its position for the next launch; a completed
+    // traversal resets it so the next run re-verifies everything.
+    flush_scan_progress(
+        album_id,
+        traversed_count,
+        &mut last_cursor_write,
+        &mut touch_buffer,
+        &mut prefix_touch,
+        current_scan_time,
+        true,
+    );
+    if scan_complete {
+        let _ = Album::update_scan_cursor(album_id, 0);
+    }
+
     if scan_complete {
         let _ = Album::update_progress(album_id, final_snapshot.processed, total_files);
     } else if scan_failed {

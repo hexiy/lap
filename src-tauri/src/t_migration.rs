@@ -153,6 +153,11 @@ fn get_migrations() -> Vec<Migration> {
             description: "Add tag groups and persistent ordering",
             sql: "",
         },
+        Migration {
+            version: 18,
+            description: "Add albums.scan_cursor for resumable scans",
+            sql: "",
+        },
     ]
 }
 
@@ -470,6 +475,14 @@ pub fn check_and_migrate(conn: &Connection) -> Result<(), String> {
                 }
             } else if migration.version == 17 {
                 migrate_tag_groups(conn)?;
+            } else if migration.version == 18 {
+                if !table_has_column(conn, "albums", "scan_cursor")? {
+                    conn.execute(
+                        "ALTER TABLE albums ADD COLUMN scan_cursor INTEGER NOT NULL DEFAULT 0",
+                        [],
+                    )
+                    .map_err(|e| format!("Migration 18 failed adding scan_cursor: {}", e))?;
+                }
             } else if !migration.sql.trim().is_empty() {
                 conn.execute_batch(migration.sql)
                     .map_err(|e| format!("Migration {} failed: {}", migration.version, e))?;

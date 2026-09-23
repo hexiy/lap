@@ -17,8 +17,8 @@ use std::{
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -28,9 +28,109 @@ use tokio::io::AsyncWriteExt;
 
 pub struct AiEngine {
     text_model: Option<Session>,
-    vision_model: Option<Session>,
+    vision_pool: Option<Arc<VisionSessionPool>>,
     tokenizer: Option<Tokenizer>,
     text_model_kind: ImageSearchTextModel,
+}
+
+/// A small pool of ONNX vision sessions. `Session::run` needs `&mut self`, so
+/// each session lives behind its own mutex and callers acquire them
+/// round-robin — image embedding then scales past one worker without
+/// serializing on the engine lock (which still guards the text model).
+pub struct VisionSessionPool {
+    sessions: Vec<Mutex<Session>>,
+    next: AtomicUsize,
+}
+
+const VISION_SESSION_COUNT: usize = 2;
+
+impl VisionSessionPool {
+    fn load(path: &Path) -> Result<Self, String> {
+        let mut sessions = Vec::with_capacity(VISION_SESSION_COUNT);
+        for _ in 0..VISION_SESSION_COUNT {
+            match AiEngine::load_session(path, "vision") {
+                Ok(session) => sessions.push(Mutex::new(session)),
+                // Keep a working pool even if the second session fails to
+                // allocate — one session still beats none.
+                Err(error) if sessions.is_empty() => return Err(error),
+                Err(_) => break,
+            }
+        }
+        Ok(Self {
+            sessions,
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    fn acquire(&self) -> &Mutex<Session> {
+        &self.sessions[self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len()]
+    }
+
+    pub fn encode_image(&self, image_path: &str) -> Result<Vec<f32>, String> {
+        let img = image::open(image_path)
+            .map_err(|e| format!("Failed to open image: {}", e))?;
+        let image_input = Self::preprocess_dynamic_image(img);
+        self.run(image_input)
+    }
+
+    pub fn encode_image_from_bytes(&self, image_bytes: &[u8]) -> Result<Vec<f32>, String> {
+        let img = image::load_from_memory(image_bytes)
+            .map_err(|e| format!("Failed to load image from memory: {}", e))?;
+        let image_input = Self::preprocess_dynamic_image(img);
+        self.run(image_input)
+    }
+
+    fn run(&self, image_input: Array4<f32>) -> Result<Vec<f32>, String> {
+        let image_input_value = Value::from_array(image_input).map_err(|e| e.to_string())?;
+
+        let mut session = self
+            .acquire()
+            .lock()
+            .map_err(|_| "Vision session mutex poisoned".to_string())?;
+        let outputs = session
+            .run(inputs![
+                "pixel_values" => image_input_value,
+            ])
+            .map_err(|e| format!("Inference error: {}", e))?;
+
+        let embedding = if let Some(vals) = outputs.get("pooler_output") {
+            vals
+        } else if let Some(vals) = outputs.get("image_embeds") {
+            vals
+        } else {
+            &outputs[0]
+        };
+
+        let (_, embedding_data) = embedding
+            .try_extract_tensor::<f32>()
+            .map_err(|e| format!("Failed to extract tensor: {}", e))?;
+
+        Ok(embedding_data.to_vec())
+    }
+
+    fn preprocess_dynamic_image(img: DynamicImage) -> Array4<f32> {
+        // resize to 224x224
+        let img = img.resize_exact(224, 224, image::imageops::FilterType::Triangle);
+        let rgb_img = img.to_rgb8();
+
+        // Normalize
+        let mean = [0.48145466, 0.4578275, 0.40821073];
+        let std = [0.26862954, 0.26130258, 0.27577711];
+
+        let mut array = Array::zeros((1, 3, 224, 224));
+
+        for (x, y, pixel) in rgb_img.enumerate_pixels() {
+            let r = (pixel[0] as f32 / 255.0 - mean[0]) / std[0];
+            let g = (pixel[1] as f32 / 255.0 - mean[1]) / std[1];
+            let b = (pixel[2] as f32 / 255.0 - mean[2]) / std[2];
+
+            array[[0, 0, y as usize, x as usize]] = r;
+            array[[0, 1, y as usize, x as usize]] = g;
+            array[[0, 2, y as usize, x as usize]] = b;
+        }
+
+        array
+    }
 }
 
 const AI_INTRA_THREADS: usize = 2;
@@ -170,14 +270,14 @@ impl AiEngine {
     pub fn new() -> Self {
         Self {
             text_model: None,
-            vision_model: None,
+            vision_pool: None,
             tokenizer: None,
             text_model_kind: ImageSearchTextModel::Default,
         }
     }
 
     pub fn load_models(&mut self, app: &AppHandle) -> Result<(), String> {
-        if self.text_model.is_some() && self.vision_model.is_some() {
+        if self.text_model.is_some() && self.vision_pool.is_some() {
             return Ok(());
         }
 
@@ -186,9 +286,8 @@ impl AiEngine {
         let resource_dir = Self::resource_model_dir(app)?;
         let vision_model_path = resource_dir.join(t_common::AI_VISION_MODEL);
         // Load Vision Model
-        if self.vision_model.is_none() {
-            let vision_model = Self::load_session(&vision_model_path, "vision")?;
-            self.vision_model = Some(vision_model);
+        if self.vision_pool.is_none() {
+            self.vision_pool = Some(Arc::new(VisionSessionPool::load(&vision_model_path)?));
         }
 
         if self.text_model.is_none() {
@@ -304,7 +403,7 @@ impl AiEngine {
     }
 
     fn ensure_embedding_dimensions_match(&mut self) -> Result<(), String> {
-        if self.vision_model.is_none() {
+        if self.vision_pool.is_none() {
             return Ok(());
         }
         let text_dim = self.encode_text("__lap_embedding_probe__")?.len();
@@ -319,7 +418,13 @@ impl AiEngine {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.text_model.is_some() && self.vision_model.is_some() && self.tokenizer.is_some()
+        self.text_model.is_some() && self.vision_pool.is_some() && self.tokenizer.is_some()
+    }
+
+    /// Clone of the shared vision session pool — embedding workers use this
+    /// without holding the engine lock so inference can run in parallel.
+    pub fn vision_pool(&self) -> Option<Arc<VisionSessionPool>> {
+        self.vision_pool.clone()
     }
 
     pub fn encode_text(&mut self, text: &str) -> Result<Vec<f32>, String> {
@@ -410,81 +515,12 @@ impl AiEngine {
         Ok(embedding_data.to_vec())
     }
 
-    pub fn encode_image(&mut self, image_path: &str) -> Result<Vec<f32>, String> {
-        if !self.is_loaded() {
-            return Err("AI models not loaded".to_string());
-        }
-
-        let image_input = self.preprocess_image(image_path)?;
-        self.run_vision_model(image_input)
-    }
-
-    pub fn encode_image_from_bytes(&mut self, image_bytes: &[u8]) -> Result<Vec<f32>, String> {
-        if !self.is_loaded() {
-            return Err("AI models not loaded".to_string());
-        }
-
-        let img = image::load_from_memory(image_bytes)
-            .map_err(|e| format!("Failed to load image from memory: {}", e))?;
-        let image_input = self.preprocess_dynamic_image(img)?;
-
-        self.run_vision_model(image_input)
-    }
-
-    fn run_vision_model(&mut self, image_input: Array4<f32>) -> Result<Vec<f32>, String> {
-        let image_input_value = Value::from_array(image_input).map_err(|e| e.to_string())?;
-
-        let outputs = self
-            .vision_model
-            .as_mut()
-            .unwrap()
-            .run(inputs![
-                "pixel_values" => image_input_value,
-            ])
-            .map_err(|e| format!("Inference error: {}", e))?;
-
-        let embedding = if let Some(vals) = outputs.get("pooler_output") {
-            vals
-        } else if let Some(vals) = outputs.get("image_embeds") {
-            vals
-        } else {
-            &outputs[0]
-        };
-
-        let (_, embedding_data) = embedding
-            .try_extract_tensor::<f32>()
-            .map_err(|e| format!("Failed to extract tensor: {}", e))?;
-
-        Ok(embedding_data.to_vec())
-    }
-
-    fn preprocess_image(&self, path: &str) -> Result<Array4<f32>, String> {
-        let img = image::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
-        self.preprocess_dynamic_image(img)
-    }
-
-    fn preprocess_dynamic_image(&self, img: DynamicImage) -> Result<Array4<f32>, String> {
-        // resize to 224x224
-        let img = img.resize_exact(224, 224, image::imageops::FilterType::Triangle);
-        let rgb_img = img.to_rgb8();
-
-        // Normalize
-        let mean = [0.48145466, 0.4578275, 0.40821073];
-        let std = [0.26862954, 0.26130258, 0.27577711];
-
-        let mut array = Array::zeros((1, 3, 224, 224));
-
-        for (x, y, pixel) in rgb_img.enumerate_pixels() {
-            let r = (pixel[0] as f32 / 255.0 - mean[0]) / std[0];
-            let g = (pixel[1] as f32 / 255.0 - mean[1]) / std[1];
-            let b = (pixel[2] as f32 / 255.0 - mean[2]) / std[2];
-
-            array[[0, 0, y as usize, x as usize]] = r;
-            array[[0, 1, y as usize, x as usize]] = g;
-            array[[0, 2, y as usize, x as usize]] = b;
-        }
-
-        Ok(array)
+    fn run_vision_model(&self, image_input: Array4<f32>) -> Result<Vec<f32>, String> {
+        let pool = self
+            .vision_pool
+            .as_ref()
+            .ok_or_else(|| "Vision model not loaded".to_string())?;
+        pool.run(image_input)
     }
 }
 
